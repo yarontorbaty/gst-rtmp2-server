@@ -46,10 +46,12 @@ typedef enum {
   RTMP2_MESSAGE_SET_PEER_BANDWIDTH = 6,
   RTMP2_MESSAGE_AUDIO = 8,
   RTMP2_MESSAGE_VIDEO = 9,
-  RTMP2_MESSAGE_AMF3_METADATA = 15,
-  RTMP2_MESSAGE_AMF0_METADATA = 18,
-  RTMP2_MESSAGE_AMF0_COMMAND = 20,
-  RTMP2_MESSAGE_AMF3_COMMAND = 17
+  RTMP2_MESSAGE_AMF3_METADATA = 15,    /* AMF3-encoded Data Message */
+  RTMP2_MESSAGE_AMF3_SHARED_OBJECT = 16, /* AMF3-encoded Shared Object */
+  RTMP2_MESSAGE_AMF3_COMMAND = 17,      /* AMF3-encoded Command Message */
+  RTMP2_MESSAGE_AMF0_METADATA = 18,    /* AMF0-encoded Data Message */
+  RTMP2_MESSAGE_AMF0_SHARED_OBJECT = 19, /* AMF0-encoded Shared Object */
+  RTMP2_MESSAGE_AMF0_COMMAND = 20       /* AMF0-encoded Command Message */
 } Rtmp2MessageType;
 
 typedef struct {

@@ -123,6 +123,20 @@ rtmp2_flv_parser_process (Rtmp2FlvParser * parser, const guint8 * data,
       tag->video_codec = (Rtmp2FlvVideoCodec) (codec_info & 0x0f);
       tag->video_keyframe = ((codec_info >> 4) & 0x0f) == 1;
 
+      /* Enhanced RTMP: Check for extended codec ID (12-15) */
+      if (tag->video_codec == 12) {
+        if (remaining >= 1) {
+          guint8 ext_codec = read_uint8 (&ptr, &remaining);
+          if (ext_codec == 0) {
+            tag->video_codec = RTMP2_FLV_VIDEO_CODEC_H265;
+          } else if (ext_codec == 1) {
+            tag->video_codec = RTMP2_FLV_VIDEO_CODEC_VP9;
+          } else if (ext_codec == 2) {
+            tag->video_codec = RTMP2_FLV_VIDEO_CODEC_AV1;
+          }
+        }
+      }
+
       tag->data = gst_buffer_new_allocate (NULL, data_size - 1, NULL);
       GstMapInfo map;
       if (gst_buffer_map (tag->data, &map, GST_MAP_WRITE)) {
@@ -145,6 +159,11 @@ rtmp2_flv_parser_process (Rtmp2FlvParser * parser, const guint8 * data,
       tag->audio_sample_rate = ((codec_info >> 2) & 0x03);
       tag->audio_sample_size = ((codec_info >> 1) & 0x01);
       tag->audio_channels = (codec_info & 0x01);
+
+      /* Enhanced RTMP: Check for extended audio codec (13 = Opus) */
+      if (tag->audio_codec == 13) {
+        tag->audio_codec = RTMP2_FLV_AUDIO_CODEC_OPUS;
+      }
 
       tag->data = gst_buffer_new_allocate (NULL, data_size - 1, NULL);
       GstMapInfo map;
@@ -205,6 +224,14 @@ rtmp2_flv_tag_get_caps (Rtmp2FlvTag * tag)
             "stream-format", G_TYPE_STRING, "hev1",
             "alignment", G_TYPE_STRING, "au",
             NULL);
+      case RTMP2_FLV_VIDEO_CODEC_VP9:
+        return gst_caps_new_simple ("video/x-vp9",
+            "profile", G_TYPE_STRING, "0",
+            NULL);
+      case RTMP2_FLV_VIDEO_CODEC_AV1:
+        return gst_caps_new_simple ("video/x-av1",
+            "stream-format", G_TYPE_STRING, "obu-stream",
+            NULL);
       default:
         return NULL;
     }
@@ -219,6 +246,10 @@ rtmp2_flv_tag_get_caps (Rtmp2FlvTag * tag)
         return gst_caps_new_simple ("audio/mpeg",
             "mpegversion", G_TYPE_INT, 1,
             "layer", G_TYPE_INT, 3,
+            NULL);
+      case RTMP2_FLV_AUDIO_CODEC_OPUS:
+        return gst_caps_new_simple ("audio/x-opus",
+            "streamheader", GST_TYPE_BUFFER, NULL,
             NULL);
       default:
         return NULL;

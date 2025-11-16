@@ -41,6 +41,8 @@ gst_rtmp2_server_sources = [
   'gst/rtmp2chunk.c',
   'gst/rtmp2flv.c',
   'gst/rtmp2client.c',
+  'gst/rtmp2amf.c',
+  'gst/rtmp2enhanced.c',
 ]
 
 gst_rtmp2_server_headers = [
@@ -50,6 +52,8 @@ gst_rtmp2_server_headers = [
   'gst/rtmp2chunk.h',
   'gst/rtmp2flv.h',
   'gst/rtmp2client.h',
+  'gst/rtmp2amf.h',
+  'gst/rtmp2enhanced.h',
 ]
 
 gst_rtmp2_server = library('gstrtmp2server',

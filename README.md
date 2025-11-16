@@ -9,14 +9,20 @@ This plugin provides a GStreamer source element that acts as an RTMP server, acc
 ## Features
 
 - **RTMP Server**: Listens for incoming RTMP connections on a configurable port
-- **E-RTMP Support**: TLS/SSL encryption (RTMPS) for secure streaming
+- **Enhanced RTMP (E-RTMP) v2 Support**: Full implementation of Enhanced RTMP specification
+  - **TLS/SSL encryption** (RTMPS) for secure streaming
+  - **AMF3 support** (message types 15, 16, 17) in addition to AMF0
+  - **Enhanced Connect Command** with capability negotiation (capsEx, videoFourCcInfoMap)
+  - **Enhanced Video Codecs**: H.264, H.265/HEVC, VP9, AV1
+  - **Enhanced Audio Codecs**: AAC, MP3, Opus, G.711
+  - **Multitrack Streaming**: Support for multiple audio/video tracks
+  - **Reconnect Request**: Client reconnection capabilities
+  - **Timestamp Nano Offset**: Higher precision timestamps
+  - **Enhanced Metadata**: Enhanced onMetaData format support
 - **RTMP Protocol Support**:
   - RTMP handshake (C0/C1/C2, S0/S1/S2)
   - RTMP chunk protocol parsing
   - FLV tag demuxing for video and audio
-- **Codec Support**:
-  - Video: H.264, H.265
-  - Audio: AAC, MP3
 - **Stream Management**:
   - Application name routing (`/live/streamkey`)
   - Optional stream key validation

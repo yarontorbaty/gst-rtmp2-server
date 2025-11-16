@@ -108,6 +108,15 @@ rtmp2_client_new (GSocketConnection * connection, GIOStream * io_stream)
   client->publish_received = FALSE;
   client->last_activity = g_get_monotonic_time ();
 
+  /* Initialize Enhanced RTMP capabilities */
+  client->client_caps = rtmp2_enhanced_capabilities_new ();
+  client->server_caps = rtmp2_enhanced_capabilities_new ();
+  client->server_caps->caps_ex = RTMP2_CAPS_RECONNECT | RTMP2_CAPS_MULTITRACK |
+      RTMP2_CAPS_TIMESTAMP_NANO_OFFSET;
+  client->server_caps->supports_amf3 = TRUE;
+  client->supports_amf3 = FALSE;
+  client->timestamp_nano_offset = 0;
+
   return client;
 }
 
@@ -133,6 +142,11 @@ rtmp2_client_free (Rtmp2Client * client)
   g_free (client->application);
   g_free (client->stream_key);
   g_free (client->tc_url);
+
+  if (client->client_caps)
+    rtmp2_enhanced_capabilities_free (client->client_caps);
+  if (client->server_caps)
+    rtmp2_enhanced_capabilities_free (client->server_caps);
 
   if (client->io_stream)
     g_object_unref (client->io_stream);
@@ -279,18 +293,34 @@ rtmp2_client_process_data (Rtmp2Client * client, GError ** error)
         }
         break;
 
-      case RTMP2_MESSAGE_AMF0_COMMAND:{
+      case RTMP2_MESSAGE_AMF0_COMMAND:
+      case RTMP2_MESSAGE_AMF3_COMMAND:{
         GstMapInfo map;
         if (gst_buffer_map (msg->buffer, &map, GST_MAP_READ)) {
+          const guint8 *cmd_data = map.data;
+          gsize cmd_size = map.size;
+
+          /* Skip AMF3 format selector if present */
+          if (msg->message_type == RTMP2_MESSAGE_AMF3_COMMAND && cmd_size > 0 &&
+              cmd_data[0] == 0) {
+            cmd_data++;
+            cmd_size--;
+          }
+
           if (!client->connect_received) {
-            rtmp2_client_parse_connect (client, map.data, map.size, error);
+            rtmp2_client_parse_connect (client, cmd_data, cmd_size, error);
           } else if (!client->publish_received) {
-            rtmp2_client_parse_publish (client, map.data, map.size, error);
+            rtmp2_client_parse_publish (client, cmd_data, cmd_size, error);
           }
           gst_buffer_unmap (msg->buffer, &map);
         }
         break;
       }
+
+      case RTMP2_MESSAGE_AMF0_METADATA:
+      case RTMP2_MESSAGE_AMF3_METADATA:
+        /* Enhanced metadata - handle if needed */
+        break;
 
       case RTMP2_MESSAGE_VIDEO:
       case RTMP2_MESSAGE_AUDIO:
@@ -390,9 +420,44 @@ rtmp2_client_send_peer_bandwidth (Rtmp2Client * client, guint32 size,
 gboolean
 rtmp2_client_send_connect_result (Rtmp2Client * client, GError ** error)
 {
-  /* Simplified - full implementation would parse AMF0 and send proper response */
-  client->state = RTMP2_CLIENT_STATE_CONNECTED;
-  return TRUE;
+  GByteArray *ba = g_byte_array_new ();
+  guint8 basic_header = 0x03;  /* Chunk stream ID 3, type 0 */
+  guint8 message_type = client->supports_amf3 ?
+      RTMP2_MESSAGE_AMF3_COMMAND : RTMP2_MESSAGE_AMF0_COMMAND;
+  gsize bytes_written;
+
+  /* Write basic header */
+  write_uint8 (ba, basic_header);
+  write_uint24_be (ba, 0);     /* timestamp */
+  write_uint32_le (ba, 0);     /* message stream ID */
+
+  /* Write message type and length (will update later) */
+  gsize msg_start = ba->len;
+  write_uint24_be (ba, 0);     /* message length placeholder */
+  write_uint8 (ba, message_type);
+
+  /* Write AMF0 command response */
+  if (client->supports_amf3) {
+    /* AMF3 format selector byte */
+    write_uint8 (ba, 0);       /* Format 0 = AMF0 */
+  }
+
+  rtmp2_enhanced_send_connect_result (ba, client->server_caps, error);
+
+  /* Update message length */
+  guint32 msg_len = ba->len - msg_start - 4;
+  ba->data[msg_start] = (msg_len >> 16) & 0xff;
+  ba->data[msg_start + 1] = (msg_len >> 8) & 0xff;
+  ba->data[msg_start + 2] = msg_len & 0xff;
+
+  gboolean ret = g_output_stream_write_all (client->output_stream, ba->data,
+      ba->len, &bytes_written, NULL, error);
+  g_byte_array_free (ba, TRUE);
+
+  if (ret)
+    client->state = RTMP2_CLIENT_STATE_CONNECTED;
+
+  return ret;
 }
 
 gboolean
@@ -406,8 +471,23 @@ gboolean
 rtmp2_client_parse_connect (Rtmp2Client * client, const guint8 * data,
     gsize size, GError ** error)
 {
-  /* Simplified parsing - full implementation would parse AMF0 */
   GstRtmp2ServerSrc *src = (GstRtmp2ServerSrc *) client->user_data;
+  const guint8 *ptr = data;
+  gsize remaining = size;
+
+  /* Check for AMF3 format selector */
+  if (remaining > 0 && data[0] == 0) {
+    ptr++;
+    remaining--;
+  }
+
+  /* Parse Enhanced RTMP connect command */
+  if (!rtmp2_enhanced_parse_connect (ptr, remaining, client->client_caps,
+          error)) {
+    return FALSE;
+  }
+
+  client->supports_amf3 = client->client_caps->supports_amf3;
 
   if (src && src->application) {
     client->application = g_strdup (src->application);

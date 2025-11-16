@@ -26,6 +26,8 @@
 #include "rtmp2handshake.h"
 #include "rtmp2chunk.h"
 #include "rtmp2flv.h"
+#include "rtmp2amf.h"
+#include "rtmp2enhanced.h"
 
 G_BEGIN_DECLS
 
@@ -59,6 +61,12 @@ typedef struct _Rtmp2Client {
   gboolean handshake_complete;
   gboolean connect_received;
   gboolean publish_received;
+  
+  /* Enhanced RTMP support */
+  Rtmp2EnhancedCapabilities *client_caps;
+  Rtmp2EnhancedCapabilities *server_caps;
+  gboolean supports_amf3;
+  guint64 timestamp_nano_offset;
   
   guint64 last_activity;
   guint timeout_seconds;
