@@ -28,10 +28,13 @@
 static guint8
 read_uint8 (const guint8 ** data, gsize * size)
 {
+  guint8 val;
   if (*size < 1)
     return 0;
+  val = (*data)[0];
+  (*data)++;
   (*size)--;
-  return (*data)++;
+  return val;
 }
 
 static guint32

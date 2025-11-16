@@ -37,7 +37,7 @@ GST_PLUGIN_DEFINE (GST_VERSION_MAJOR,
     rtmp2server,
     "RTMP2 Server Source Plugin",
     plugin_init,
-    VERSION,
+    PACKAGE_VERSION,
     GST_LICENSE,
     GST_PACKAGE_NAME,
     GST_PACKAGE_ORIGIN)

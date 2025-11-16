@@ -26,6 +26,8 @@
 #include "gstrtmp2serversrc.h"
 
 #include <string.h>
+#include <gio/gio.h>
+#include <gio/giotypes.h>
 
 GST_DEBUG_CATEGORY_STATIC (gst_rtmp2_server_src_debug);
 #define GST_CAT_DEFAULT gst_rtmp2_server_src_debug
@@ -304,8 +306,8 @@ server_accept_cb (GSocket * socket, GIOCondition condition, gpointer user_data)
   GError *error = NULL;
   Rtmp2Client *client;
 
-  connection = g_socket_accept (socket, NULL, &error);
-  if (!connection) {
+  GSocket *client_socket = g_socket_accept (socket, NULL, &error);
+  if (!client_socket) {
     GST_WARNING_OBJECT (src, "Failed to accept connection: %s",
         error ? error->message : "Unknown error");
     if (error)
@@ -313,13 +315,22 @@ server_accept_cb (GSocket * socket, GIOCondition condition, gpointer user_data)
     return G_SOURCE_CONTINUE;
   }
 
+  connection = g_socket_connection_factory_create_connection (client_socket);
+  g_object_unref (client_socket);
+
+  if (!connection) {
+    GST_WARNING_OBJECT (src, "Failed to create connection");
+    return G_SOURCE_CONTINUE;
+  }
+
   /* Wrap with TLS if enabled */
   if (src->tls && src->tls_cert) {
-    GTlsServerConnection *tls_conn;
+    GIOStream *tls_io_stream;
+    GTlsConnection *tls_connection;
 
-    tls_conn = g_tls_server_connection_new (G_IO_STREAM (connection),
+    tls_io_stream = g_tls_server_connection_new (G_IO_STREAM (connection),
         src->tls_cert, &error);
-    if (!tls_conn) {
+    if (!tls_io_stream) {
       GST_WARNING_OBJECT (src, "Failed to create TLS connection: %s",
           error ? error->message : "Unknown error");
       if (error)
@@ -328,15 +339,14 @@ server_accept_cb (GSocket * socket, GIOCondition condition, gpointer user_data)
       return G_SOURCE_CONTINUE;
     }
 
-    g_tls_server_connection_set_authentication_mode (tls_conn,
-        G_TLS_AUTHENTICATION_NONE);
+    tls_connection = G_TLS_CONNECTION (tls_io_stream);
 
-    tls_stream = G_IO_STREAM (tls_conn);
+    tls_stream = tls_io_stream;
     g_object_unref (connection);
     connection = NULL;
 
     /* Perform TLS handshake */
-    if (!g_tls_connection_handshake (G_TLS_CONNECTION (tls_conn), NULL, &error)) {
+    if (!g_tls_connection_handshake (tls_connection, NULL, &error)) {
       GST_WARNING_OBJECT (src, "TLS handshake failed: %s",
           error ? error->message : "Unknown error");
       if (error)

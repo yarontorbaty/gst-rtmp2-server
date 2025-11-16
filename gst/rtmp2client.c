@@ -33,14 +33,14 @@ write_uint8 (GByteArray * ba, guint8 val)
   g_byte_array_append (ba, &val, 1);
 }
 
-static void
-write_uint16_be (GByteArray * ba, guint16 val)
-{
-  guint8 data[2];
-  data[0] = (val >> 8) & 0xff;
-  data[1] = val & 0xff;
-  g_byte_array_append (ba, data, 2);
-}
+/* static void */
+/* write_uint16_be (GByteArray * ba, guint16 val) */
+/* { */
+/*   guint8 data[2]; */
+/*   data[0] = (val >> 8) & 0xff; */
+/*   data[1] = val & 0xff; */
+/*   g_byte_array_append (ba, data, 2); */
+/* } */
 
 static void
 write_uint24_be (GByteArray * ba, guint32 val)
@@ -191,9 +191,6 @@ rtmp2_client_process_data (Rtmp2Client * client, GError ** error)
   GList *messages = NULL;
   GList *l;
   Rtmp2ChunkMessage *msg;
-  GList *flv_tags = NULL;
-  Rtmp2FlvTag *tag;
-  GstRtmp2ServerSrc *src;
 
   if (client->state == RTMP2_CLIENT_STATE_DISCONNECTED ||
       client->state == RTMP2_CLIENT_STATE_ERROR) {

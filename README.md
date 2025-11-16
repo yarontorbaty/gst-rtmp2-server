@@ -128,6 +128,19 @@ ffmpeg -i input.mp4 -c copy -f flv rtmps://localhost:1935/live/mystream
 
 Note: For production use, use a proper certificate from a Certificate Authority (CA).
 
+### Enhanced RTMP (E-RTMP) Features
+
+The plugin implements Enhanced RTMP v2 specification as defined by [Veovera](https://veovera.org/docs/enhanced/enhanced-rtmp-v2.html). Enhanced RTMP provides:
+
+1. **AMF3 Support**: More efficient encoding format (message types 15, 16, 17)
+2. **Enhanced Codecs**: Support for modern codecs (H.265, VP9, AV1, Opus)
+3. **Capability Negotiation**: Clients and servers negotiate features via `capsEx` flags
+4. **Multitrack Streaming**: Multiple audio/video tracks in a single stream
+5. **Reconnect Support**: Clients can reconnect without full handshake
+6. **Enhanced Metadata**: Richer metadata format with more information
+
+The server automatically advertises Enhanced RTMP capabilities in the connect response. Clients that support Enhanced RTMP will negotiate capabilities during the connect handshake.
+
 ### Multiple Streams
 
 The plugin supports multiple simultaneous connections. Each client can push to a different stream key:

@@ -47,26 +47,24 @@ rtmp2_enhanced_capabilities_free (Rtmp2EnhancedCapabilities * caps)
   g_free (caps);
 }
 
-static gboolean
-parse_video_fourcc_info_map (const guint8 ** data, gsize * size,
-    GHashTable * map, GError ** error)
-{
-  Rtmp2AmfValue value;
-  guint32 count;
-  guint32 i;
+/* static gboolean */
+/* parse_video_fourcc_info_map (const guint8 ** data, gsize * size, */
+/*     GHashTable * map, GError ** error) */
+/* { */
+/*   Rtmp2AmfValue value; */
 
-  if (!rtmp2_amf0_parse (data, size, &value, error))
-    return FALSE;
+/*   if (!rtmp2_amf0_parse (data, size, &value, error)) */
+/*     return FALSE; */
 
-  if (value.amf0_type != RTMP2_AMF0_ECMA_ARRAY) {
-    rtmp2_amf_value_free (&value);
-    return FALSE;
-  }
+/*   if (value.amf0_type != RTMP2_AMF0_ECMA_ARRAY) { */
+/*     rtmp2_amf_value_free (&value); */
+/*     return FALSE; */
+/*   } */
 
-  /* Simplified - full implementation would parse ECMA array */
-  rtmp2_amf_value_free (&value);
-  return TRUE;
-}
+/*   /\* Simplified - full implementation would parse ECMA array *\/ */
+/*   rtmp2_amf_value_free (&value); */
+/*   return TRUE; */
+/* } */
 
 gboolean
 rtmp2_enhanced_parse_connect (const guint8 * data, gsize size,
@@ -76,7 +74,6 @@ rtmp2_enhanced_parse_connect (const guint8 * data, gsize size,
   gsize remaining = size;
   Rtmp2AmfValue value;
   gchar *command_name = NULL;
-  gdouble transaction_id = 0;
   GHashTable *command_object = NULL;
 
   /* Parse command name */
@@ -99,8 +96,9 @@ rtmp2_enhanced_parse_connect (const guint8 * data, gsize size,
     g_free (command_name);
     return FALSE;
   }
-  if (value.amf0_type == RTMP2_AMF0_NUMBER) {
-    transaction_id = value.value.number;
+  /* Transaction ID parsed but not used for now */
+  if (value.amf0_type != RTMP2_AMF0_NUMBER) {
+    /* Expected number for transaction ID */
   }
 
   /* Parse command object */
