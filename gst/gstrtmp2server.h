@@ -56,6 +56,9 @@ struct _GstRtmp2ServerSrc {
   gchar *application;
   gchar *stream_key;
   guint timeout;
+  gboolean tls;
+  gchar *certificate;
+  gchar *private_key;
 
   /* Server state */
   GSocket *server_socket;
@@ -63,6 +66,8 @@ struct _GstRtmp2ServerSrc {
   GMainContext *context;
   GList *clients;
   GMutex clients_lock;
+  GTlsCertificate *tls_cert;
+  GTlsCertificate *tls_key;
 
   /* Current active client */
   Rtmp2Client *active_client;

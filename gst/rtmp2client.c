@@ -75,15 +75,28 @@ write_uint32_le (GByteArray * ba, guint32 val)
 }
 
 Rtmp2Client *
-rtmp2_client_new (GSocketConnection * connection)
+rtmp2_client_new (GSocketConnection * connection, GIOStream * io_stream)
 {
   Rtmp2Client *client;
+  GIOStream *stream_to_use;
 
   client = g_new0 (Rtmp2Client, 1);
-  client->connection = g_object_ref (connection);
-  client->socket = g_socket_connection_get_socket (connection);
-  client->input_stream = g_io_stream_get_input_stream (G_IO_STREAM (connection));
-  client->output_stream = g_io_stream_get_output_stream (G_IO_STREAM (connection));
+
+  /* Use TLS stream if provided, otherwise use connection's stream */
+  if (io_stream) {
+    client->io_stream = g_object_ref (io_stream);
+    stream_to_use = io_stream;
+  } else if (connection) {
+    client->connection = g_object_ref (connection);
+    client->socket = g_socket_connection_get_socket (connection);
+    stream_to_use = G_IO_STREAM (connection);
+  } else {
+    g_free (client);
+    return NULL;
+  }
+
+  client->input_stream = g_io_stream_get_input_stream (stream_to_use);
+  client->output_stream = g_io_stream_get_output_stream (stream_to_use);
 
   client->state = RTMP2_CLIENT_STATE_HANDSHAKE;
   rtmp2_handshake_init (&client->handshake);
@@ -121,6 +134,8 @@ rtmp2_client_free (Rtmp2Client * client)
   g_free (client->stream_key);
   g_free (client->tc_url);
 
+  if (client->io_stream)
+    g_object_unref (client->io_stream);
   if (client->connection)
     g_object_unref (client->connection);
 

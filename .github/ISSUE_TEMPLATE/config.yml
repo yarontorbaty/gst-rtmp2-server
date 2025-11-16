@@ -1,0 +1,9 @@
+blank_issues_enabled: false
+contact_links:
+  - name: GStreamer Community Support
+    url: https://gstreamer.freedesktop.org/support/
+    about: Get help from the GStreamer community
+  - name: GStreamer Documentation
+    url: https://gstreamer.freedesktop.org/documentation/
+    about: Check the GStreamer documentation
+

@@ -41,6 +41,7 @@ typedef enum {
 typedef struct _Rtmp2Client {
   GSocket *socket;
   GSocketConnection *connection;
+  GIOStream *io_stream;
   GInputStream *input_stream;
   GOutputStream *output_stream;
   GSource *read_source;
@@ -65,7 +66,7 @@ typedef struct _Rtmp2Client {
   gpointer user_data;
 } Rtmp2Client;
 
-Rtmp2Client *rtmp2_client_new (GSocketConnection *connection);
+Rtmp2Client *rtmp2_client_new (GSocketConnection *connection, GIOStream *io_stream);
 void rtmp2_client_free (Rtmp2Client *client);
 gboolean rtmp2_client_process_data (Rtmp2Client *client, GError **error);
 gboolean rtmp2_client_send_handshake (Rtmp2Client *client, GError **error);

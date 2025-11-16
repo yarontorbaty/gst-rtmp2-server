@@ -37,7 +37,10 @@ enum
   PROP_PORT,
   PROP_APPLICATION,
   PROP_STREAM_KEY,
-  PROP_TIMEOUT
+  PROP_TIMEOUT,
+  PROP_TLS,
+  PROP_CERTIFICATE,
+  PROP_PRIVATE_KEY
 };
 
 static GstStaticPadTemplate src_template = GST_STATIC_PAD_TEMPLATE ("src",
@@ -107,6 +110,21 @@ gst_rtmp2_server_src_class_init (GstRtmp2ServerSrcClass * klass)
           "Client timeout in seconds (default: 30)",
           1, 3600, 30, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
+  g_object_class_install_property (gobject_class, PROP_TLS,
+      g_param_spec_boolean ("tls", "TLS",
+          "Enable TLS/SSL encryption (E-RTMP/RTMPS) (default: false)",
+          FALSE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (gobject_class, PROP_CERTIFICATE,
+      g_param_spec_string ("certificate", "Certificate",
+          "Path to TLS certificate file (PEM format)",
+          NULL, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (gobject_class, PROP_PRIVATE_KEY,
+      g_param_spec_string ("private-key", "Private Key",
+          "Path to TLS private key file (PEM format)",
+          NULL, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
   gst_element_class_add_static_pad_template (gstelement_class, &src_template);
 
   gst_element_class_set_static_metadata (gstelement_class,
@@ -127,12 +145,17 @@ gst_rtmp2_server_src_init (GstRtmp2ServerSrc * src)
   src->application = g_strdup ("live");
   src->stream_key = NULL;
   src->timeout = 30;
+  src->tls = FALSE;
+  src->certificate = NULL;
+  src->private_key = NULL;
 
   src->server_socket = NULL;
   src->server_source = NULL;
   src->context = NULL;
   src->clients = NULL;
   g_mutex_init (&src->clients_lock);
+  src->tls_cert = NULL;
+  src->tls_key = NULL;
 
   src->active_client = NULL;
   src->have_video = FALSE;
@@ -149,6 +172,13 @@ gst_rtmp2_server_src_finalize (GObject * object)
   g_free (src->host);
   g_free (src->application);
   g_free (src->stream_key);
+  g_free (src->certificate);
+  g_free (src->private_key);
+
+  if (src->tls_cert)
+    g_object_unref (src->tls_cert);
+  if (src->tls_key)
+    g_object_unref (src->tls_key);
 
   if (src->video_caps)
     gst_caps_unref (src->video_caps);
@@ -185,6 +215,43 @@ gst_rtmp2_server_src_set_property (GObject * object, guint prop_id,
     case PROP_TIMEOUT:
       src->timeout = g_value_get_uint (value);
       break;
+    case PROP_TLS:
+      src->tls = g_value_get_boolean (value);
+      break;
+    case PROP_CERTIFICATE:{
+      g_free (src->certificate);
+      src->certificate = g_value_dup_string (value);
+      if (src->certificate) {
+        GError *error = NULL;
+        if (src->tls_cert)
+          g_object_unref (src->tls_cert);
+        src->tls_cert = g_tls_certificate_new_from_file (src->certificate, &error);
+        if (error) {
+          GST_WARNING_OBJECT (src, "Failed to load certificate: %s",
+              error->message);
+          g_error_free (error);
+        }
+      }
+      break;
+    }
+    case PROP_PRIVATE_KEY:{
+      g_free (src->private_key);
+      src->private_key = g_value_dup_string (value);
+      /* Note: GTlsCertificate can load both cert and key from same file */
+      if (src->private_key && src->certificate) {
+        GError *error = NULL;
+        if (src->tls_cert)
+          g_object_unref (src->tls_cert);
+        src->tls_cert = g_tls_certificate_new_from_files (src->certificate,
+            src->private_key, &error);
+        if (error) {
+          GST_WARNING_OBJECT (src, "Failed to load certificate/key: %s",
+              error->message);
+          g_error_free (error);
+        }
+      }
+      break;
+    }
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
@@ -213,6 +280,15 @@ gst_rtmp2_server_src_get_property (GObject * object, guint prop_id,
     case PROP_TIMEOUT:
       g_value_set_uint (value, src->timeout);
       break;
+    case PROP_TLS:
+      g_value_set_boolean (value, src->tls);
+      break;
+    case PROP_CERTIFICATE:
+      g_value_set_string (value, src->certificate);
+      break;
+    case PROP_PRIVATE_KEY:
+      g_value_set_string (value, src->private_key);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
@@ -224,6 +300,7 @@ server_accept_cb (GSocket * socket, GIOCondition condition, gpointer user_data)
 {
   GstRtmp2ServerSrc *src = GST_RTMP2_SERVER_SRC (user_data);
   GSocketConnection *connection;
+  GIOStream *tls_stream = NULL;
   GError *error = NULL;
   Rtmp2Client *client;
 
@@ -236,9 +313,47 @@ server_accept_cb (GSocket * socket, GIOCondition condition, gpointer user_data)
     return G_SOURCE_CONTINUE;
   }
 
-  client = rtmp2_client_new (connection);
-  if (!client) {
+  /* Wrap with TLS if enabled */
+  if (src->tls && src->tls_cert) {
+    GTlsServerConnection *tls_conn;
+
+    tls_conn = g_tls_server_connection_new (G_IO_STREAM (connection),
+        src->tls_cert, &error);
+    if (!tls_conn) {
+      GST_WARNING_OBJECT (src, "Failed to create TLS connection: %s",
+          error ? error->message : "Unknown error");
+      if (error)
+        g_error_free (error);
+      g_object_unref (connection);
+      return G_SOURCE_CONTINUE;
+    }
+
+    g_tls_server_connection_set_authentication_mode (tls_conn,
+        G_TLS_AUTHENTICATION_NONE);
+
+    tls_stream = G_IO_STREAM (tls_conn);
     g_object_unref (connection);
+    connection = NULL;
+
+    /* Perform TLS handshake */
+    if (!g_tls_connection_handshake (G_TLS_CONNECTION (tls_conn), NULL, &error)) {
+      GST_WARNING_OBJECT (src, "TLS handshake failed: %s",
+          error ? error->message : "Unknown error");
+      if (error)
+        g_error_free (error);
+      g_object_unref (tls_stream);
+      return G_SOURCE_CONTINUE;
+    }
+
+    GST_INFO_OBJECT (src, "TLS handshake completed");
+  }
+
+  client = rtmp2_client_new (connection, tls_stream ? tls_stream : NULL);
+  if (!client) {
+    if (tls_stream)
+      g_object_unref (tls_stream);
+    if (connection)
+      g_object_unref (connection);
     return G_SOURCE_CONTINUE;
   }
 
@@ -249,7 +364,7 @@ server_accept_cb (GSocket * socket, GIOCondition condition, gpointer user_data)
   src->clients = g_list_append (src->clients, client);
   g_mutex_unlock (&src->clients_lock);
 
-  GST_INFO_OBJECT (src, "New client connected");
+  GST_INFO_OBJECT (src, "New client connected%s", src->tls ? " (TLS)" : "");
 
   return G_SOURCE_CONTINUE;
 }

@@ -9,6 +9,7 @@ This plugin provides a GStreamer source element that acts as an RTMP server, acc
 ## Features
 
 - **RTMP Server**: Listens for incoming RTMP connections on a configurable port
+- **E-RTMP Support**: TLS/SSL encryption (RTMPS) for secure streaming
 - **RTMP Protocol Support**:
   - RTMP handshake (C0/C1/C2, S0/S1/S2)
   - RTMP chunk protocol parsing
@@ -26,6 +27,8 @@ This plugin provides a GStreamer source element that acts as an RTMP server, acc
   - Application name (default: "live")
   - Stream key validation (optional)
   - Client timeout
+  - TLS/SSL encryption (E-RTMP)
+  - TLS certificate and private key
 
 ## Building
 
@@ -97,6 +100,28 @@ gst-launch-1.0 rtmp2serversrc port=1935 stream-key=secret123 ! \
     video/x-h264 ! h264parse ! mp4mux ! filesink location=output.mp4
 ```
 
+### E-RTMP (RTMPS) with TLS/SSL
+
+To enable secure RTMP streaming with TLS encryption:
+
+```bash
+# Generate self-signed certificate (for testing)
+openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes
+
+# Start RTMPS server
+gst-launch-1.0 rtmp2serversrc port=1935 tls=true \
+    certificate=cert.pem private-key=key.pem ! \
+    video/x-h264 ! h264parse ! mp4mux ! filesink location=output.mp4
+```
+
+Push from FFmpeg using RTMPS:
+
+```bash
+ffmpeg -i input.mp4 -c copy -f flv rtmps://localhost:1935/live/mystream
+```
+
+Note: For production use, use a proper certificate from a Certificate Authority (CA).
+
 ### Multiple Streams
 
 The plugin supports multiple simultaneous connections. Each client can push to a different stream key:
@@ -118,6 +143,9 @@ ffmpeg -i input2.mp4 -c copy -f flv rtmp://localhost:1935/live/stream2
 | `application` | string | "live" | RTMP application name |
 | `stream-key` | string | NULL | Optional stream key validation |
 | `timeout` | int | 30 | Client timeout in seconds |
+| `tls` | boolean | false | Enable TLS/SSL encryption (E-RTMP/RTMPS) |
+| `certificate` | string | NULL | Path to TLS certificate file (PEM format) |
+| `private-key` | string | NULL | Path to TLS private key file (PEM format) |
 
 ## Pipeline Examples
 
