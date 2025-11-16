@@ -1,0 +1,14 @@
+build/
+*.o
+*.a
+*.so
+*.la
+*.lo
+.deps/
+.libs/
+*.swp
+*~
+*.log
+config.h
+compile_commands.json
+
