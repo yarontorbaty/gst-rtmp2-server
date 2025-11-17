@@ -2,7 +2,11 @@
 
 ## Current Status
 
-I have a working RTMP server (gst-rtmp2-server) that successfully receives streams from FFmpeg. The server is on branch `fix/flv-tag-reconstruction` at commit `02a76da`.
+I have a working RTMP server (gst-rtmp2-server) that successfully receives streams from FFmpeg.
+
+**Branch**: `fix/flv-tag-reconstruction` (commit `ad89ee3`)  
+**GitHub Issue**: #1 - https://github.com/yarontorbaty/gst-rtmp2-server/issues/1  
+**Base**: Branched from `main` which has the fully working RTMP protocol implementation
 
 ## VERIFIED WORKING ✅
 
@@ -65,9 +69,17 @@ Format:
 [Stream ID: 3 bytes][Tag Data: N bytes][Previous Tag Size: 4 bytes]
 ```
 
-## GitHub Issue
+## GitHub Issue & Branch
 
-Issue #1 tracks this: https://github.com/yarontorbaty/gst-rtmp2-server/issues/1
+**Issue**: #1 - FLV tag reconstruction - 0-byte output with filesink  
+**URL**: https://github.com/yarontorbaty/gst-rtmp2-server/issues/1  
+**Branch**: `fix/flv-tag-reconstruction` (currently checked out)  
+**Commits**: 
+- `0f4920a` - Implement FLV tag reconstruction from RTMP messages
+- `02a76da` - Set video/x-flv caps in start function
+- `ad89ee3` - Add CONTINUE_HERE.md (this file)
+
+**Main branch status**: COMPLETE AND WORKING - RTMP protocol fully functional
 
 ## The Question
 
