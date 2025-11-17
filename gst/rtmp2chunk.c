@@ -335,8 +335,9 @@ rtmp2_chunk_parser_process (Rtmp2ChunkParser * parser, const guint8 * data,
       GST_DEBUG ("Message complete! type=%u, length=%u", msg->message_type, msg->message_length);
       msg->complete = TRUE;
       *messages = g_list_append (*messages, msg);
-      /* Don't remove from hash table yet - caller will free it after processing */
-      /* g_hash_table_remove (parser->chunk_streams, GUINT_TO_POINTER (chunk_stream_id)); */
+      /* Remove from hash table so next message on this stream creates a fresh entry */
+      /* Note: we steal the reference, so don't free the message here */
+      g_hash_table_steal (parser->chunk_streams, GUINT_TO_POINTER (chunk_stream_id));
     }
   }
 

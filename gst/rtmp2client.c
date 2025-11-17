@@ -630,14 +630,20 @@ rtmp2_client_process_data (Rtmp2Client * client, GError ** error)
         error && *error ? (*error)->message : "Unknown");
     return FALSE;
   }
-  GST_DEBUG ("Chunk parser returned %d messages", g_list_length (messages));
+  gint msg_count = g_list_length (messages);
+  GST_DEBUG ("Chunk parser returned %d messages", msg_count);
+  if (msg_count > 0) {
+    GST_INFO ("Processing %d RTMP messages from this read", msg_count);
+  }
 
   /* Process messages */
+  gint msg_idx = 0;
   for (l = messages; l; l = l->next) {
     msg = (Rtmp2ChunkMessage *) l->data;
+    msg_idx++;
 
-    GST_DEBUG ("Processing message: type=%d, length=%u, timestamp=%u, stream_id=%u, buffer=%p",
-        msg->message_type, msg->message_length, msg->timestamp, msg->message_stream_id, msg->buffer);
+    GST_DEBUG ("Processing message %d/%d: type=%d, length=%u, timestamp=%u, stream_id=%u, buffer=%p",
+        msg_idx, msg_count, msg->message_type, msg->message_length, msg->timestamp, msg->message_stream_id, msg->buffer);
 
     if (!msg->buffer) {
       GST_WARNING ("Message has no buffer, skipping");
@@ -716,6 +722,7 @@ rtmp2_client_process_data (Rtmp2Client * client, GError ** error)
                     gdouble transaction_id = 0.0;
                     gchar *stream_name = NULL;
 
+                    GST_INFO ("Handling releaseStream");
                     if (rtmp2_amf0_parse (&cmd_ptr, &cmd_remaining, &value, NULL)) {
                       if (value.amf0_type == RTMP2_AMF0_NUMBER)
                         transaction_id = value.value.number;
@@ -734,9 +741,12 @@ rtmp2_client_process_data (Rtmp2Client * client, GError ** error)
                       client->stream_key = g_strdup (stream_name);
                     }
 
+                    GST_INFO ("Sending releaseStream result (txn=%.0f)", transaction_id);
                     if (!rtmp2_client_send_release_stream_result (client,
                             transaction_id, error)) {
                       GST_WARNING ("Failed to send releaseStream result");
+                    } else {
+                      GST_INFO ("releaseStream result sent successfully");
                     }
                     g_free (stream_name);
                   } else if (g_strcmp0 (cmd_name, "FCPublish") == 0) {
@@ -744,6 +754,7 @@ rtmp2_client_process_data (Rtmp2Client * client, GError ** error)
                     gdouble transaction_id = 0.0;
                     gchar *stream_name = NULL;
 
+                    GST_INFO ("Handling FCPublish");
                     if (rtmp2_amf0_parse (&cmd_ptr, &cmd_remaining, &value, NULL)) {
                       if (value.amf0_type == RTMP2_AMF0_NUMBER)
                         transaction_id = value.value.number;
@@ -764,13 +775,18 @@ rtmp2_client_process_data (Rtmp2Client * client, GError ** error)
                       client->stream_key = g_strdup (stream_name);
                     }
 
+                    GST_INFO ("Sending FCPublish responses");
                     if (!rtmp2_client_send_on_fc_publish (client, stream_name,
                             error)) {
                       GST_WARNING ("Failed to send onFCPublish");
+                    } else {
+                      GST_INFO ("onFCPublish sent successfully");
                     }
                     if (!rtmp2_client_send_release_stream_result (client,
                             transaction_id, error)) {
                       GST_WARNING ("Failed to ack FCPublish");
+                    } else {
+                      GST_INFO ("FCPublish ack sent successfully");
                     }
 
                     if (stream_name)
@@ -869,17 +885,10 @@ rtmp2_client_process_data (Rtmp2Client * client, GError ** error)
 
   if (messages) {
     GList *l;
-    /* Remove messages from hash table (this also frees them via destroy notifier) */
+    /* Free all messages - they were already removed from hash table via steal() */
     for (l = messages; l; l = l->next) {
       Rtmp2ChunkMessage *msg = (Rtmp2ChunkMessage *) l->data;
-      if (client->chunk_parser.chunk_streams) {
-        /* Removing from hash table calls rtmp2_chunk_message_free via destroy notifier */
-        g_hash_table_remove (client->chunk_parser.chunk_streams,
-            GUINT_TO_POINTER (msg->chunk_stream_id));
-      } else {
-        /* Hash table already destroyed, free manually */
-        rtmp2_chunk_message_free (msg);
-      }
+      rtmp2_chunk_message_free (msg);
     }
     g_list_free (messages);
   }
