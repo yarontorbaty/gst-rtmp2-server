@@ -581,20 +581,32 @@ gst_rtmp2_server_src_create (GstPushSrc * psrc, GstBuffer ** buf)
       GST_DEBUG_OBJECT (src, "Processing handshake for client (state=%d, handshake_state=%d)",
           client->state, client->handshake.state);
       
-      /* Try to complete handshake (up to 50 reads for all handshake steps) */
-      while (attempts++ < 50 && !client->handshake_complete) {
+      /* Try to complete handshake (up to 100 reads for all handshake steps) */
+      while (attempts++ < 100 && !client->handshake_complete) {
+        /* Unlock, process events, then re-lock for reading */
+        g_mutex_unlock (&src->clients_lock);
+        g_main_context_iteration (src->context, FALSE);
+        g_usleep (1000);  /* 1ms between handshake attempts */
+        g_mutex_lock (&src->clients_lock);
+        
         if (!rtmp2_client_process_data (client, &error)) {
           if (error) {
             GST_WARNING_OBJECT (src, "Handshake error: %s", error->message);
             g_error_free (error);
             error = NULL;
           }
+          /* No data yet, break and retry later */
           break;
         }
         
         if (client->handshake_complete) {
           GST_INFO_OBJECT (src, "Handshake completed after %d attempts", attempts);
+          break;
         }
+      }
+      
+      if (!client->handshake_complete && attempts > 50) {
+        GST_WARNING_OBJECT (src, "Handshake taking too long (%d attempts)", attempts);
       }
     }
     
@@ -679,9 +691,36 @@ gst_rtmp2_server_src_create (GstPushSrc * psrc, GstBuffer ** buf)
     
     g_mutex_lock (&src->clients_lock);
     
-    /* Check if client started publishing (async callback may have updated state) */
+    /* Continue processing handshakes and check for publishing clients */
+    /* Note: Async callbacks run independently and will process post-handshake data */
     for (l = src->clients; l; l = l->next) {
       Rtmp2Client *client = (Rtmp2Client *) l->data;
+      
+      /* Process handshake if not yet complete (async reading handles post-handshake) */
+      if (!client->handshake_complete && 
+          client->state != RTMP2_CLIENT_STATE_DISCONNECTED &&
+          client->state != RTMP2_CLIENT_STATE_ERROR) {
+        GError *error = NULL;
+        gint attempts = 0;
+        
+        /* Try up to 5 reads - async will handle the rest after handshake */
+        while (attempts++ < 5 && !client->handshake_complete) {
+          if (!rtmp2_client_process_data (client, &error)) {
+            if (error) {
+              g_error_free (error);
+              error = NULL;
+            }
+            break;
+          }
+          
+          if (client->handshake_complete) {
+            GST_INFO_OBJECT (src, "Handshake completed in retry loop after %d attempts", attempts);
+            break;
+          }
+        }
+      }
+      
+      /* Check if client started publishing */
       if (client->state == RTMP2_CLIENT_STATE_PUBLISHING && !src->active_client) {
         src->active_client = client;
         GST_INFO_OBJECT (src, "Client started publishing (detected in retry loop)");
