@@ -68,13 +68,17 @@ rtmp2_enhanced_capabilities_free (Rtmp2EnhancedCapabilities * caps)
 
 gboolean
 rtmp2_enhanced_parse_connect (const guint8 * data, gsize size,
-    Rtmp2EnhancedCapabilities * client_caps, GError ** error)
+    Rtmp2EnhancedCapabilities * client_caps, gdouble * transaction_id, GError ** error)
 {
   const guint8 *ptr = data;
   gsize remaining = size;
   Rtmp2AmfValue value;
   gchar *command_name = NULL;
   GHashTable *command_object = NULL;
+
+  if (transaction_id) {
+    *transaction_id = 1.0;  /* Default if not found */
+  }
 
   /* Parse command name */
   if (!rtmp2_amf0_parse (&ptr, &remaining, &value, error))
@@ -96,9 +100,8 @@ rtmp2_enhanced_parse_connect (const guint8 * data, gsize size,
     g_free (command_name);
     return FALSE;
   }
-  /* Transaction ID parsed but not used for now */
-  if (value.amf0_type != RTMP2_AMF0_NUMBER) {
-    /* Expected number for transaction ID */
+  if (value.amf0_type == RTMP2_AMF0_NUMBER && transaction_id) {
+    *transaction_id = value.value.number;
   }
 
   /* Parse command object */
@@ -147,7 +150,7 @@ rtmp2_enhanced_parse_connect (const guint8 * data, gsize size,
 
 gboolean
 rtmp2_enhanced_send_connect_result (GByteArray * ba,
-    Rtmp2EnhancedCapabilities * server_caps, GError ** error)
+    Rtmp2EnhancedCapabilities * server_caps, gdouble transaction_id, GError ** error)
 {
   guint8 amf0_string = RTMP2_AMF0_STRING;
   guint8 amf0_number = RTMP2_AMF0_NUMBER;
@@ -157,9 +160,9 @@ rtmp2_enhanced_send_connect_result (GByteArray * ba,
   g_byte_array_append (ba, &amf0_string, 1);
   rtmp2_amf0_write_string (ba, "_result");
 
-  /* Write transaction ID (1.0) */
+  /* Write transaction ID (from connect command) */
   g_byte_array_append (ba, &amf0_number, 1);
-  rtmp2_amf0_write_number (ba, 1.0);
+  rtmp2_amf0_write_number (ba, transaction_id);
 
   /* Write command object */
   g_byte_array_append (ba, &amf0_object, 1);
@@ -167,8 +170,10 @@ rtmp2_enhanced_send_connect_result (GByteArray * ba,
   /* Write fmsVer */
   rtmp2_amf0_write_object_property (ba, "fmsVer", "FMS/3,0,1,123");
 
-  /* Write capabilities */
-  rtmp2_amf0_write_object_property (ba, "capabilities", "31.0");
+  /* Write capabilities (as number, not string) */
+  rtmp2_amf0_write_string (ba, "capabilities");
+  g_byte_array_append (ba, &amf0_number, 1);
+  rtmp2_amf0_write_number (ba, 31.0);
 
   /* Write capsEx if Enhanced RTMP is supported */
   if (server_caps) {
@@ -195,6 +200,21 @@ rtmp2_enhanced_send_connect_result (GByteArray * ba,
   }
 
   /* End object */
+  rtmp2_amf0_write_object_end (ba);
+
+  /* Information object */
+  g_byte_array_append (ba, &amf0_object, 1);
+  rtmp2_amf0_write_object_property (ba, "level", "status");
+  rtmp2_amf0_write_object_property (ba, "code",
+      "NetConnection.Connect.Success");
+  rtmp2_amf0_write_object_property (ba, "description",
+      "Connection succeeded.");
+
+  rtmp2_amf0_write_string (ba, "objectEncoding");
+  g_byte_array_append (ba, &amf0_number, 1);
+  rtmp2_amf0_write_number (ba,
+      (server_caps && server_caps->supports_amf3) ? 3.0 : 0.0);
+
   rtmp2_amf0_write_object_end (ba);
 
   return TRUE;

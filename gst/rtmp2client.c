@@ -24,8 +24,21 @@
 
 #include "rtmp2client.h"
 #include "gstrtmp2server.h"
+#include "rtmp2amf.h"
 #include <string.h>
 #include <glib/gprintf.h>
+
+/* Define our own debug category */
+GST_DEBUG_CATEGORY_STATIC (rtmp2_client_debug);
+#define GST_CAT_DEFAULT rtmp2_client_debug
+
+/* Initialize debug category - called from plugin init */
+void
+rtmp2_client_debug_init (void)
+{
+  GST_DEBUG_CATEGORY_INIT (rtmp2_client_debug, "rtmp2client",
+      0, "RTMP2 Client");
+}
 
 static void
 write_uint8 (GByteArray * ba, guint8 val)
@@ -74,6 +87,190 @@ write_uint32_le (GByteArray * ba, guint32 val)
   g_byte_array_append (ba, data, 4);
 }
 
+static void
+write_uint16_be (GByteArray * ba, guint16 val)
+{
+  guint8 data[2];
+  data[0] = (val >> 8) & 0xff;
+  data[1] = val & 0xff;
+  g_byte_array_append (ba, data, 2);
+}
+
+#define RTMP2_USER_CONTROL_STREAM_BEGIN 0
+
+static gboolean
+rtmp2_client_send_user_control (Rtmp2Client * client, guint16 event_type,
+    guint32 event_data, GError ** error)
+{
+  GByteArray *ba = g_byte_array_new ();
+  guint8 basic_header = 0x02;  /* Chunk stream ID 2, type 0 */
+  guint8 message_type = RTMP2_MESSAGE_USER_CONTROL;
+  gsize bytes_written;
+
+  /* Basic header + timestamp */
+  write_uint8 (ba, basic_header);
+  write_uint24_be (ba, 0);
+
+  /* Message header */
+  write_uint24_be (ba, 6);     /* event_type (2) + event_data (4) */
+  write_uint8 (ba, message_type);
+  write_uint32_le (ba, 0);     /* message stream ID */
+
+  /* Event payload */
+  write_uint16_be (ba, event_type);
+  write_uint32_be (ba, event_data);
+
+  gboolean ret = g_output_stream_write_all (client->output_stream, ba->data,
+      ba->len, &bytes_written, NULL, error);
+  g_byte_array_free (ba, TRUE);
+  return ret;
+}
+
+static gboolean
+rtmp2_client_send_on_bw_done (Rtmp2Client * client, GError ** error)
+{
+  GByteArray *ba = g_byte_array_new ();
+  guint8 basic_header = 0x03;  /* Chunk stream ID 3, type 0 */
+  guint8 message_type = RTMP2_MESSAGE_AMF0_COMMAND;
+  guint32 timestamp = 0;
+  gsize bytes_written;
+
+  write_uint8 (ba, basic_header);
+  write_uint24_be (ba, timestamp);
+
+  gsize msg_start = ba->len;
+  write_uint24_be (ba, 0);     /* placeholder */
+  write_uint8 (ba, message_type);
+  write_uint32_le (ba, 0);     /* message stream ID */
+
+  guint8 amf0_string = RTMP2_AMF0_STRING;
+  guint8 amf0_number = RTMP2_AMF0_NUMBER;
+  guint8 amf0_null = RTMP2_AMF0_NULL;
+
+  g_byte_array_append (ba, &amf0_string, 1);
+  rtmp2_amf0_write_string (ba, "onBWDone");
+
+  g_byte_array_append (ba, &amf0_number, 1);
+  rtmp2_amf0_write_number (ba, 0.0);
+
+  g_byte_array_append (ba, &amf0_null, 1);
+
+  g_byte_array_append (ba, &amf0_number, 1);
+  rtmp2_amf0_write_number (ba, 0.0);
+
+  guint32 msg_len = ba->len - msg_start - 3;
+  ba->data[msg_start] = (msg_len >> 16) & 0xff;
+  ba->data[msg_start + 1] = (msg_len >> 8) & 0xff;
+  ba->data[msg_start + 2] = msg_len & 0xff;
+
+  gboolean ret = g_output_stream_write_all (client->output_stream, ba->data,
+      ba->len, &bytes_written, NULL, error);
+  g_byte_array_free (ba, TRUE);
+  return ret;
+}
+
+gboolean
+rtmp2_client_send_release_stream_result (Rtmp2Client * client,
+    gdouble transaction_id, GError ** error)
+{
+  GByteArray *ba = g_byte_array_new ();
+  guint8 message_type = client->supports_amf3 ?
+      RTMP2_MESSAGE_AMF3_COMMAND : RTMP2_MESSAGE_AMF0_COMMAND;
+  gsize bytes_written;
+
+  write_uint8 (ba, 0x03);       /* chunk stream 3 type 0 */
+  write_uint24_be (ba, 0);      /* timestamp */
+
+  gsize msg_start = ba->len;
+  write_uint24_be (ba, 0);      /* placeholder */
+  write_uint8 (ba, message_type);
+  write_uint32_le (ba, 0);      /* message stream ID */
+
+  if (client->supports_amf3)
+    write_uint8 (ba, 0);        /* AMF0 switch */
+
+  guint8 amf0_string = RTMP2_AMF0_STRING;
+  guint8 amf0_number = RTMP2_AMF0_NUMBER;
+  guint8 amf0_null = RTMP2_AMF0_NULL;
+
+  g_byte_array_append (ba, &amf0_string, 1);
+  rtmp2_amf0_write_string (ba, "_result");
+
+  g_byte_array_append (ba, &amf0_number, 1);
+  rtmp2_amf0_write_number (ba, transaction_id);
+
+  g_byte_array_append (ba, &amf0_null, 1);
+
+  guint8 amf0_boolean = RTMP2_AMF0_BOOLEAN;
+  g_byte_array_append (ba, &amf0_boolean, 1);
+  rtmp2_amf0_write_boolean (ba, TRUE);
+
+  guint32 msg_len = ba->len - msg_start - 3;
+  ba->data[msg_start] = (msg_len >> 16) & 0xff;
+  ba->data[msg_start + 1] = (msg_len >> 8) & 0xff;
+  ba->data[msg_start + 2] = msg_len & 0xff;
+
+  gboolean ret = g_output_stream_write_all (client->output_stream, ba->data,
+      ba->len, &bytes_written, NULL, error);
+  g_byte_array_free (ba, TRUE);
+  return ret;
+}
+
+gboolean
+rtmp2_client_send_on_fc_publish (Rtmp2Client * client,
+    const gchar * stream_name, GError ** error)
+{
+  GByteArray *ba = g_byte_array_new ();
+  guint8 message_type = RTMP2_MESSAGE_AMF0_COMMAND;
+  gsize bytes_written;
+
+  write_uint8 (ba, 0x03);
+  write_uint24_be (ba, 0);
+
+  gsize msg_start = ba->len;
+  write_uint24_be (ba, 0);
+  write_uint8 (ba, message_type);
+  write_uint32_le (ba, 0);
+
+  guint8 amf0_string = RTMP2_AMF0_STRING;
+  guint8 amf0_number = RTMP2_AMF0_NUMBER;
+  guint8 amf0_null = RTMP2_AMF0_NULL;
+  guint8 amf0_object = RTMP2_AMF0_OBJECT;
+
+  g_byte_array_append (ba, &amf0_string, 1);
+  rtmp2_amf0_write_string (ba, "onFCPublish");
+
+  g_byte_array_append (ba, &amf0_number, 1);
+  rtmp2_amf0_write_number (ba, 0.0);
+
+  g_byte_array_append (ba, &amf0_null, 1);
+
+  g_byte_array_append (ba, &amf0_object, 1);
+  rtmp2_amf0_write_object_property (ba, "level", "status");
+  rtmp2_amf0_write_object_property (ba, "code",
+      "NetStream.Publish.Start");
+  if (stream_name) {
+    gchar *description = g_strdup_printf ("FCPublish to stream %s",
+        stream_name);
+    rtmp2_amf0_write_object_property (ba, "description", description);
+    g_free (description);
+  } else {
+    rtmp2_amf0_write_object_property (ba, "description",
+        "FCPublish received");
+  }
+  rtmp2_amf0_write_object_end (ba);
+
+  guint32 msg_len = ba->len - msg_start - 3;
+  ba->data[msg_start] = (msg_len >> 16) & 0xff;
+  ba->data[msg_start + 1] = (msg_len >> 8) & 0xff;
+  ba->data[msg_start + 2] = msg_len & 0xff;
+
+  gboolean ret = g_output_stream_write_all (client->output_stream, ba->data,
+      ba->len, &bytes_written, NULL, error);
+  g_byte_array_free (ba, TRUE);
+  return ret;
+}
+
 Rtmp2Client *
 rtmp2_client_new (GSocketConnection * connection, GIOStream * io_stream)
 {
@@ -106,14 +303,16 @@ rtmp2_client_new (GSocketConnection * connection, GIOStream * io_stream)
   client->handshake_complete = FALSE;
   client->connect_received = FALSE;
   client->publish_received = FALSE;
+  client->connect_transaction_id = 1.0;
   client->last_activity = g_get_monotonic_time ();
+  client->stream_id = 1;
 
   /* Initialize Enhanced RTMP capabilities */
   client->client_caps = rtmp2_enhanced_capabilities_new ();
   client->server_caps = rtmp2_enhanced_capabilities_new ();
   client->server_caps->caps_ex = RTMP2_CAPS_RECONNECT | RTMP2_CAPS_MULTITRACK |
       RTMP2_CAPS_TIMESTAMP_NANO_OFFSET;
-  client->server_caps->supports_amf3 = TRUE;
+  client->server_caps->supports_amf3 = FALSE;
   client->supports_amf3 = FALSE;
   client->timestamp_nano_offset = 0;
 
@@ -164,22 +363,39 @@ rtmp2_client_send_handshake (Rtmp2Client * client, GError ** error)
   guint8 s2[RTMP2_HANDSHAKE_SIZE];
   gsize bytes_written;
 
+  GST_DEBUG ("Generating handshake response (S0/S1/S2)");
   rtmp2_handshake_generate_s0 (&client->handshake, s0);
   rtmp2_handshake_generate_s1 (&client->handshake, s1);
   rtmp2_handshake_generate_s2 (&client->handshake, client->handshake.c1, s2);
 
+  GST_DEBUG ("Writing S0 (1 byte)");
   if (!g_output_stream_write_all (client->output_stream, s0, 1, &bytes_written,
-          NULL, error))
+          NULL, error)) {
+    GST_WARNING ("Failed to write S0: %s",
+        error && *error ? (*error)->message : "Unknown");
     return FALSE;
+  }
+  GST_DEBUG ("Wrote %zu bytes (S0)", bytes_written);
 
+  GST_DEBUG ("Writing S1 (%d bytes)", RTMP2_HANDSHAKE_SIZE);
   if (!g_output_stream_write_all (client->output_stream, s1, RTMP2_HANDSHAKE_SIZE,
-          &bytes_written, NULL, error))
+          &bytes_written, NULL, error)) {
+    GST_WARNING ("Failed to write S1: %s",
+        error && *error ? (*error)->message : "Unknown");
     return FALSE;
+  }
+  GST_DEBUG ("Wrote %zu bytes (S1)", bytes_written);
 
+  GST_DEBUG ("Writing S2 (%d bytes)", RTMP2_HANDSHAKE_SIZE);
   if (!g_output_stream_write_all (client->output_stream, s2, RTMP2_HANDSHAKE_SIZE,
-          &bytes_written, NULL, error))
+          &bytes_written, NULL, error)) {
+    GST_WARNING ("Failed to write S2: %s",
+        error && *error ? (*error)->message : "Unknown");
     return FALSE;
+  }
+  GST_DEBUG ("Wrote %zu bytes (S2)", bytes_written);
 
+  GST_DEBUG ("Handshake response sent successfully");
   return TRUE;
 }
 
@@ -192,89 +408,139 @@ rtmp2_client_process_data (Rtmp2Client * client, GError ** error)
   GList *l;
   Rtmp2ChunkMessage *msg;
 
+  GST_DEBUG ("Processing data for client, state=%d, handshake_complete=%d, handshake_state=%d",
+      client->state, client->handshake_complete, client->handshake.state);
+
   if (client->state == RTMP2_CLIENT_STATE_DISCONNECTED ||
       client->state == RTMP2_CLIENT_STATE_ERROR) {
+    GST_DEBUG ("Client in disconnected/error state, returning FALSE");
     return FALSE;
   }
 
   /* Handle handshake */
   if (!client->handshake_complete) {
+    GST_DEBUG ("Handshake not complete, state=%d", client->handshake.state);
     if (client->handshake.state == RTMP2_HANDSHAKE_STATE_C0) {
+      GST_DEBUG ("Reading C0 (1 byte)");
       bytes_read = g_input_stream_read (client->input_stream, buffer, 1, NULL,
           error);
-      if (bytes_read < 0)
+      GST_DEBUG ("Read %zd bytes for C0", bytes_read);
+      if (bytes_read < 0) {
+        GST_WARNING ("Failed to read C0: %s", error && *error ? (*error)->message : "Unknown");
         return FALSE;
+      }
       if (bytes_read == 0) {
+        GST_DEBUG ("EOF while reading C0");
         client->state = RTMP2_CLIENT_STATE_DISCONNECTED;
         return FALSE;
       }
       if (!rtmp2_handshake_process_c0 (&client->handshake, buffer, bytes_read)) {
+        GST_WARNING ("Failed to process C0");
         client->state = RTMP2_CLIENT_STATE_ERROR;
         return FALSE;
       }
+      GST_DEBUG ("C0 processed successfully, version=0x%02x", buffer[0]);
     } else if (client->handshake.state == RTMP2_HANDSHAKE_STATE_C1) {
+      GST_DEBUG ("Reading C1 (%d bytes)", RTMP2_HANDSHAKE_SIZE);
       bytes_read = g_input_stream_read (client->input_stream, buffer,
           RTMP2_HANDSHAKE_SIZE, NULL, error);
-      if (bytes_read < 0)
+      GST_DEBUG ("Read %zd bytes for C1 (expected %d)", bytes_read, RTMP2_HANDSHAKE_SIZE);
+      if (bytes_read < 0) {
+        GST_WARNING ("Failed to read C1: %s", error && *error ? (*error)->message : "Unknown");
         return FALSE;
+      }
       if (bytes_read == 0) {
+        GST_DEBUG ("EOF while reading C1");
         client->state = RTMP2_CLIENT_STATE_DISCONNECTED;
         return FALSE;
       }
       if (bytes_read < RTMP2_HANDSHAKE_SIZE) {
-        /* Need more data */
+        GST_DEBUG ("Need more data for C1 (%zd < %d)", bytes_read, RTMP2_HANDSHAKE_SIZE);
         return TRUE;
       }
       if (!rtmp2_handshake_process_c1 (&client->handshake, buffer, bytes_read)) {
+        GST_WARNING ("Failed to process C1");
         client->state = RTMP2_CLIENT_STATE_ERROR;
         return FALSE;
       }
+      GST_DEBUG ("C1 processed successfully, sending S0/S1/S2");
       if (!rtmp2_client_send_handshake (client, error)) {
+        GST_WARNING ("Failed to send handshake response: %s",
+            error && *error ? (*error)->message : "Unknown");
         client->state = RTMP2_CLIENT_STATE_ERROR;
         return FALSE;
       }
+      GST_DEBUG ("Handshake response (S0/S1/S2) sent successfully");
     } else if (client->handshake.state == RTMP2_HANDSHAKE_STATE_C2) {
+      GST_DEBUG ("Reading C2 (%d bytes)", RTMP2_HANDSHAKE_SIZE);
       bytes_read = g_input_stream_read (client->input_stream, buffer,
           RTMP2_HANDSHAKE_SIZE, NULL, error);
-      if (bytes_read < 0)
+      GST_DEBUG ("Read %zd bytes for C2 (expected %d)", bytes_read, RTMP2_HANDSHAKE_SIZE);
+      if (bytes_read < 0) {
+        GST_WARNING ("Failed to read C2: %s", error && *error ? (*error)->message : "Unknown");
         return FALSE;
+      }
       if (bytes_read == 0) {
+        GST_DEBUG ("EOF while reading C2");
         client->state = RTMP2_CLIENT_STATE_DISCONNECTED;
         return FALSE;
       }
       if (bytes_read < RTMP2_HANDSHAKE_SIZE) {
+        GST_DEBUG ("Need more data for C2 (%zd < %d)", bytes_read, RTMP2_HANDSHAKE_SIZE);
         return TRUE;
       }
       if (!rtmp2_handshake_process_c2 (&client->handshake, buffer, bytes_read)) {
+        GST_WARNING ("Failed to process C2");
         client->state = RTMP2_CLIENT_STATE_ERROR;
         return FALSE;
       }
+      GST_DEBUG ("C2 processed successfully, handshake complete!");
       client->handshake_complete = TRUE;
       client->state = RTMP2_CLIENT_STATE_CONNECTING;
+    } else {
+      GST_WARNING ("Unknown handshake state: %d", client->handshake.state);
     }
     return TRUE;
   }
 
   /* Read RTMP chunks */
+  GST_DEBUG ("Reading RTMP chunks (handshake complete)");
   bytes_read = g_input_stream_read (client->input_stream, buffer,
       sizeof (buffer), NULL, error);
-  if (bytes_read < 0)
+  GST_DEBUG ("Read %zd bytes of chunk data", bytes_read);
+  if (bytes_read < 0) {
+    GST_WARNING ("Failed to read chunk data: %s",
+        error && *error ? (*error)->message : "Unknown");
     return FALSE;
+  }
   if (bytes_read == 0) {
+    GST_DEBUG ("EOF while reading chunks");
     client->state = RTMP2_CLIENT_STATE_DISCONNECTED;
     return FALSE;
   }
 
   client->last_activity = g_get_monotonic_time ();
 
+  GST_DEBUG ("Processing %zd bytes through chunk parser", bytes_read);
   if (!rtmp2_chunk_parser_process (&client->chunk_parser, buffer, bytes_read,
           &messages, error)) {
+    GST_WARNING ("Failed to process chunks: %s",
+        error && *error ? (*error)->message : "Unknown");
     return FALSE;
   }
+  GST_DEBUG ("Chunk parser returned %d messages", g_list_length (messages));
 
   /* Process messages */
   for (l = messages; l; l = l->next) {
     msg = (Rtmp2ChunkMessage *) l->data;
+
+    GST_DEBUG ("Processing message: type=%d, length=%u, timestamp=%u, stream_id=%u, buffer=%p",
+        msg->message_type, msg->message_length, msg->timestamp, msg->message_stream_id, msg->buffer);
+
+    if (!msg->buffer) {
+      GST_WARNING ("Message has no buffer, skipping");
+      continue;
+    }
 
     switch (msg->message_type) {
       case RTMP2_MESSAGE_SET_CHUNK_SIZE:
@@ -293,23 +559,154 @@ rtmp2_client_process_data (Rtmp2Client * client, GError ** error)
       case RTMP2_MESSAGE_AMF0_COMMAND:
       case RTMP2_MESSAGE_AMF3_COMMAND:{
         GstMapInfo map;
+        GST_DEBUG ("Processing AMF command message (AMF0=%d, AMF3=%d)",
+            msg->message_type == RTMP2_MESSAGE_AMF0_COMMAND,
+            msg->message_type == RTMP2_MESSAGE_AMF3_COMMAND);
         if (gst_buffer_map (msg->buffer, &map, GST_MAP_READ)) {
           const guint8 *cmd_data = map.data;
           gsize cmd_size = map.size;
 
+          GST_DEBUG ("Command data: %zu bytes", cmd_size);
+
           /* Skip AMF3 format selector if present */
           if (msg->message_type == RTMP2_MESSAGE_AMF3_COMMAND && cmd_size > 0 &&
               cmd_data[0] == 0) {
+            GST_DEBUG ("Skipping AMF3 format selector");
             cmd_data++;
             cmd_size--;
           }
 
           if (!client->connect_received) {
-            rtmp2_client_parse_connect (client, cmd_data, cmd_size, error);
+            GST_DEBUG ("Parsing connect command");
+            if (rtmp2_client_parse_connect (client, cmd_data, cmd_size, error)) {
+              GST_DEBUG ("Connect command parsed successfully, state=%d", client->state);
+            } else {
+              GST_WARNING ("Failed to parse connect command: %s",
+                  error && *error ? (*error)->message : "Unknown");
+            }
           } else if (!client->publish_received) {
-            rtmp2_client_parse_publish (client, cmd_data, cmd_size, error);
+            GST_DEBUG ("Parsing command (not connect, not publish yet)");
+            /* Check if it's a publish command */
+            if (cmd_size > 0) {
+              const guint8 *cmd_ptr = cmd_data;
+              gsize cmd_remaining = cmd_size;
+              Rtmp2AmfValue value;
+              gchar *cmd_name = NULL;
+              
+              /* Parse command name */
+              if (rtmp2_amf0_parse (&cmd_ptr, &cmd_remaining, &value, NULL)) {
+                if (value.amf0_type == RTMP2_AMF0_STRING) {
+                  cmd_name = g_strdup (value.value.string);
+                  g_free (value.value.string);
+                  GST_INFO ("Received command: %s (connect=%d, publish=%d)",
+                      cmd_name, client->connect_received, client->publish_received);
+                  
+                  if (g_strcmp0 (cmd_name, "publish") == 0) {
+                    GST_DEBUG ("Parsing publish command");
+                    if (rtmp2_client_parse_publish (client, cmd_data, cmd_size, error)) {
+                      GST_DEBUG ("Publish command parsed successfully, state=%d", client->state);
+                    } else {
+                      GST_WARNING ("Failed to parse publish command: %s",
+                          error && *error ? (*error)->message : "Unknown");
+                    }
+                  } else if (g_strcmp0 (cmd_name, "releaseStream") == 0) {
+                    Rtmp2AmfValue value;
+                    gdouble transaction_id = 0.0;
+                    gchar *stream_name = NULL;
+
+                    if (rtmp2_amf0_parse (&cmd_ptr, &cmd_remaining, &value, NULL)) {
+                      if (value.amf0_type == RTMP2_AMF0_NUMBER)
+                        transaction_id = value.value.number;
+                      rtmp2_amf_value_free (&value);
+                    }
+                    if (rtmp2_amf0_parse (&cmd_ptr, &cmd_remaining, &value, NULL))
+                      rtmp2_amf_value_free (&value);
+                    if (rtmp2_amf0_parse (&cmd_ptr, &cmd_remaining, &value, NULL)) {
+                      if (value.amf0_type == RTMP2_AMF0_STRING)
+                        stream_name = g_strdup (value.value.string);
+                      rtmp2_amf_value_free (&value);
+                    }
+
+                    if (stream_name) {
+                      g_free (client->stream_key);
+                      client->stream_key = g_strdup (stream_name);
+                    }
+
+                    if (!rtmp2_client_send_release_stream_result (client,
+                            transaction_id, error)) {
+                      GST_WARNING ("Failed to send releaseStream result");
+                    }
+                    g_free (stream_name);
+                  } else if (g_strcmp0 (cmd_name, "FCPublish") == 0) {
+                    Rtmp2AmfValue value;
+                    gdouble transaction_id = 0.0;
+                    gchar *stream_name = NULL;
+
+                    if (rtmp2_amf0_parse (&cmd_ptr, &cmd_remaining, &value, NULL)) {
+                      if (value.amf0_type == RTMP2_AMF0_NUMBER)
+                        transaction_id = value.value.number;
+                      rtmp2_amf_value_free (&value);
+                    }
+                    if (rtmp2_amf0_parse (&cmd_ptr, &cmd_remaining, &value, NULL))
+                      rtmp2_amf_value_free (&value);
+                    if (rtmp2_amf0_parse (&cmd_ptr, &cmd_remaining, &value, NULL)) {
+                      if (value.amf0_type == RTMP2_AMF0_STRING)
+                        stream_name = g_strdup (value.value.string);
+                      rtmp2_amf_value_free (&value);
+                    }
+
+                    if (!stream_name && client->stream_key)
+                      stream_name = g_strdup (client->stream_key);
+                    else if (stream_name) {
+                      g_free (client->stream_key);
+                      client->stream_key = g_strdup (stream_name);
+                    }
+
+                    if (!rtmp2_client_send_on_fc_publish (client, stream_name,
+                            error)) {
+                      GST_WARNING ("Failed to send onFCPublish");
+                    }
+                    if (!rtmp2_client_send_release_stream_result (client,
+                            transaction_id, error)) {
+                      GST_WARNING ("Failed to ack FCPublish");
+                    }
+
+                    if (stream_name)
+                      g_free (stream_name);
+                  } else if (g_strcmp0 (cmd_name, "createStream") == 0) {
+                    GST_INFO ("Received createStream command - sending response");
+                    gdouble transaction_id = 1.0;
+                    Rtmp2AmfValue txn_value;
+                    if (rtmp2_amf0_parse (&cmd_ptr, &cmd_remaining, &txn_value, NULL)) {
+                      if (txn_value.amf0_type == RTMP2_AMF0_NUMBER)
+                        transaction_id = txn_value.value.number;
+                      rtmp2_amf_value_free (&txn_value);
+                    }
+                    /* Consume command object if present */
+                    if (rtmp2_amf0_parse (&cmd_ptr, &cmd_remaining, &txn_value, NULL)) {
+                      rtmp2_amf_value_free (&txn_value);
+                    }
+                    if (!rtmp2_client_send_create_stream_result (client, transaction_id, error)) {
+                      GST_WARNING ("Failed to send createStream result");
+                    } else {
+                      client->stream_id = 1;
+                      GST_DEBUG ("createStream result sent successfully (transaction_id=%f)", transaction_id);
+                    }
+                  } else {
+                    GST_INFO ("Unknown command: %s (connect=%d, publish=%d)",
+                        cmd_name, client->connect_received, client->publish_received);
+                  }
+                  g_free (cmd_name);
+                }
+              }
+            }
+          } else {
+            GST_DEBUG ("Unknown command (connect=%d, publish=%d)",
+                client->connect_received, client->publish_received);
           }
           gst_buffer_unmap (msg->buffer, &map);
+        } else {
+          GST_WARNING ("Failed to map message buffer");
         }
         break;
       }
@@ -321,6 +718,9 @@ rtmp2_client_process_data (Rtmp2Client * client, GError ** error)
 
       case RTMP2_MESSAGE_VIDEO:
       case RTMP2_MESSAGE_AUDIO:
+        GST_DEBUG ("Processing %s message (type=%d)",
+            msg->message_type == RTMP2_MESSAGE_VIDEO ? "video" : "audio",
+            msg->message_type);
         if (client->state == RTMP2_CLIENT_STATE_PUBLISHING) {
           GstMapInfo map;
           GList *new_tags = NULL;
@@ -339,7 +739,18 @@ rtmp2_client_process_data (Rtmp2Client * client, GError ** error)
   }
 
   if (messages) {
-    g_list_free_full (messages, (GDestroyNotify) rtmp2_chunk_message_free);
+    GList *l;
+    /* Free messages and remove from hash table */
+    for (l = messages; l; l = l->next) {
+      Rtmp2ChunkMessage *msg = (Rtmp2ChunkMessage *) l->data;
+      /* Remove from hash table if still there */
+      if (client->chunk_parser.chunk_streams) {
+        g_hash_table_remove (client->chunk_parser.chunk_streams,
+            GUINT_TO_POINTER (msg->chunk_stream_id));
+      }
+      rtmp2_chunk_message_free (msg);
+    }
+    g_list_free (messages);
   }
 
   return TRUE;
@@ -363,6 +774,33 @@ rtmp2_client_send_ack (Rtmp2Client * client, guint32 bytes, GError ** error)
   gboolean ret = g_output_stream_write_all (client->output_stream, ba->data,
       ba->len, &bytes_written, NULL, error);
   g_byte_array_free (ba, TRUE);
+
+  return ret;
+}
+
+gboolean
+rtmp2_client_send_set_chunk_size (Rtmp2Client * client, guint32 size,
+    GError ** error)
+{
+  GByteArray *ba = g_byte_array_new ();
+  guint8 basic_header = 0x02;  /* Chunk stream ID 2, type 0 */
+  guint8 message_type = RTMP2_MESSAGE_SET_CHUNK_SIZE;
+
+  write_uint8 (ba, basic_header);
+  write_uint24_be (ba, 0);     /* timestamp */
+  write_uint24_be (ba, 4);     /* message length */
+  write_uint8 (ba, message_type);
+  write_uint32_le (ba, 0);     /* message stream ID */
+  write_uint32_be (ba, size);  /* chunk size */
+
+  gsize bytes_written;
+  gboolean ret = g_output_stream_write_all (client->output_stream, ba->data,
+      ba->len, &bytes_written, NULL, error);
+  g_byte_array_free (ba, TRUE);
+
+  if (ret) {
+    client->chunk_parser.config.chunk_size = size;
+  }
 
   return ret;
 }
@@ -418,20 +856,21 @@ gboolean
 rtmp2_client_send_connect_result (Rtmp2Client * client, GError ** error)
 {
   GByteArray *ba = g_byte_array_new ();
-  guint8 basic_header = 0x03;  /* Chunk stream ID 3, type 0 */
   guint8 message_type = client->supports_amf3 ?
       RTMP2_MESSAGE_AMF3_COMMAND : RTMP2_MESSAGE_AMF0_COMMAND;
+  guint32 timestamp = 0;
   gsize bytes_written;
 
-  /* Write basic header */
+  /* Write basic header and message header (type 0 for first message) */
+  guint8 basic_header = 0x03;  /* Chunk stream ID 3, type 0 */
   write_uint8 (ba, basic_header);
-  write_uint24_be (ba, 0);     /* timestamp */
-  write_uint32_le (ba, 0);     /* message stream ID */
-
-  /* Write message type and length (will update later) */
+  write_uint24_be (ba, timestamp);
+  
+  /* Write message length (will update later) */
   gsize msg_start = ba->len;
   write_uint24_be (ba, 0);     /* message length placeholder */
   write_uint8 (ba, message_type);
+  write_uint32_le (ba, 0);     /* message stream ID */
 
   /* Write AMF0 command response */
   if (client->supports_amf3) {
@@ -439,16 +878,33 @@ rtmp2_client_send_connect_result (Rtmp2Client * client, GError ** error)
     write_uint8 (ba, 0);       /* Format 0 = AMF0 */
   }
 
-  rtmp2_enhanced_send_connect_result (ba, client->server_caps, error);
+  rtmp2_enhanced_send_connect_result (ba, client->server_caps, client->connect_transaction_id, error);
 
-  /* Update message length */
-  guint32 msg_len = ba->len - msg_start - 4;
+  /* Update message length (message type + message stream ID + AMF data) */
+guint32 msg_len = ba->len - msg_start - 3;  /* Subtract the 3-byte placeholder */
   ba->data[msg_start] = (msg_len >> 16) & 0xff;
   ba->data[msg_start + 1] = (msg_len >> 8) & 0xff;
   ba->data[msg_start + 2] = msg_len & 0xff;
 
+  GST_DEBUG ("Sending connect result: %u bytes (message length=%u)",
+      ba->len, msg_len);
+  GST_DEBUG ("Connect result hex dump (first 32 bytes): %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
+      ba->len > 0 ? ba->data[0] : 0, ba->len > 1 ? ba->data[1] : 0, ba->len > 2 ? ba->data[2] : 0, ba->len > 3 ? ba->data[3] : 0,
+      ba->len > 4 ? ba->data[4] : 0, ba->len > 5 ? ba->data[5] : 0, ba->len > 6 ? ba->data[6] : 0, ba->len > 7 ? ba->data[7] : 0,
+      ba->len > 8 ? ba->data[8] : 0, ba->len > 9 ? ba->data[9] : 0, ba->len > 10 ? ba->data[10] : 0, ba->len > 11 ? ba->data[11] : 0,
+      ba->len > 12 ? ba->data[12] : 0, ba->len > 13 ? ba->data[13] : 0, ba->len > 14 ? ba->data[14] : 0, ba->len > 15 ? ba->data[15] : 0,
+      ba->len > 16 ? ba->data[16] : 0, ba->len > 17 ? ba->data[17] : 0, ba->len > 18 ? ba->data[18] : 0, ba->len > 19 ? ba->data[19] : 0,
+      ba->len > 20 ? ba->data[20] : 0, ba->len > 21 ? ba->data[21] : 0, ba->len > 22 ? ba->data[22] : 0, ba->len > 23 ? ba->data[23] : 0,
+      ba->len > 24 ? ba->data[24] : 0, ba->len > 25 ? ba->data[25] : 0, ba->len > 26 ? ba->data[26] : 0, ba->len > 27 ? ba->data[27] : 0,
+      ba->len > 28 ? ba->data[28] : 0, ba->len > 29 ? ba->data[29] : 0, ba->len > 30 ? ba->data[30] : 0, ba->len > 31 ? ba->data[31] : 0);
   gboolean ret = g_output_stream_write_all (client->output_stream, ba->data,
       ba->len, &bytes_written, NULL, error);
+  if (!ret) {
+    GST_WARNING ("Failed to send connect result: %s",
+        error && *error ? (*error)->message : "Unknown");
+  } else {
+    GST_DEBUG ("Connect result sent successfully: %zu bytes written", bytes_written);
+  }
   g_byte_array_free (ba, TRUE);
 
   if (ret)
@@ -458,9 +914,140 @@ rtmp2_client_send_connect_result (Rtmp2Client * client, GError ** error)
 }
 
 gboolean
+rtmp2_client_send_create_stream_result (Rtmp2Client * client, gdouble transaction_id, GError ** error)
+{
+  GByteArray *ba = g_byte_array_new ();
+  guint8 basic_header = 0x03;  /* Chunk stream ID 3, type 0 */
+  guint8 message_type = RTMP2_MESSAGE_AMF0_COMMAND;
+  gsize bytes_written;
+
+  /* Write basic header */
+  write_uint8 (ba, basic_header);
+
+  /* Write message header (type 0: 11 bytes) */
+  write_uint24_be (ba, 0);     /* timestamp */
+  
+  /* Write message length (will update later) */
+  gsize msg_start = ba->len;
+  write_uint24_be (ba, 0);     /* message length placeholder */
+  write_uint8 (ba, message_type);
+  write_uint32_le (ba, 0);     /* message stream ID */
+
+  /* Write AMF0 command response: "_result", transaction_id, null, stream_id */
+  guint8 amf0_string = RTMP2_AMF0_STRING;
+  guint8 amf0_number = RTMP2_AMF0_NUMBER;
+  guint8 amf0_null = RTMP2_AMF0_NULL;
+  
+  /* "_result" */
+  g_byte_array_append (ba, &amf0_string, 1);
+  rtmp2_amf0_write_string (ba, "_result");
+  
+  /* Transaction ID */
+  g_byte_array_append (ba, &amf0_number, 1);
+  rtmp2_amf0_write_number (ba, transaction_id);
+  
+  /* Null (command info) */
+  g_byte_array_append (ba, &amf0_null, 1);
+  
+  /* Stream ID (1.0) */
+  g_byte_array_append (ba, &amf0_number, 1);
+  rtmp2_amf0_write_number (ba, 1.0);
+
+  /* Update message length */
+  guint32 msg_len = ba->len - msg_start - 3;
+  ba->data[msg_start] = (msg_len >> 16) & 0xff;
+  ba->data[msg_start + 1] = (msg_len >> 8) & 0xff;
+  ba->data[msg_start + 2] = msg_len & 0xff;
+
+  GST_DEBUG ("Sending createStream result: %u bytes (message length=%u)",
+      ba->len, msg_len);
+  gboolean ret = g_output_stream_write_all (client->output_stream, ba->data,
+      ba->len, &bytes_written, NULL, error);
+  g_byte_array_free (ba, TRUE);
+
+  if (ret && G_IS_OUTPUT_STREAM (client->output_stream)) {
+    g_output_stream_flush (client->output_stream, NULL, NULL);
+  }
+
+  return ret;
+}
+
+gboolean
+rtmp2_client_send_on_status (Rtmp2Client * client, guint8 chunk_stream_id,
+    guint32 message_stream_id, const gchar * level, const gchar * code,
+    const gchar * description, GError ** error)
+{
+  GByteArray *ba = g_byte_array_new ();
+  guint8 message_type = RTMP2_MESSAGE_AMF0_COMMAND;
+  guint32 timestamp = 0;
+  gsize bytes_written;
+
+  /* Chunk type 0 header so that message stream ID is always defined */
+  guint8 basic_header = chunk_stream_id & 0x3f;
+  write_uint8 (ba, basic_header);
+  write_uint24_be (ba, timestamp);
+
+  gsize msg_start = ba->len;
+  write_uint24_be (ba, 0);     /* placeholder */
+  write_uint8 (ba, message_type);
+  write_uint32_le (ba, message_stream_id);
+
+  guint8 amf0_string = RTMP2_AMF0_STRING;
+  guint8 amf0_number = RTMP2_AMF0_NUMBER;
+  guint8 amf0_null = RTMP2_AMF0_NULL;
+  guint8 amf0_object = RTMP2_AMF0_OBJECT;
+
+  g_byte_array_append (ba, &amf0_string, 1);
+  rtmp2_amf0_write_string (ba, "onStatus");
+
+  g_byte_array_append (ba, &amf0_number, 1);
+  rtmp2_amf0_write_number (ba, 0.0);
+
+  g_byte_array_append (ba, &amf0_null, 1);
+  g_byte_array_append (ba, &amf0_object, 1);
+
+  rtmp2_amf0_write_object_property (ba, "level", level);
+  rtmp2_amf0_write_object_property (ba, "code", code);
+  rtmp2_amf0_write_object_property (ba, "description", description);
+
+  rtmp2_amf0_write_object_end (ba);
+
+  guint32 msg_len = ba->len - msg_start - 3;
+  ba->data[msg_start] = (msg_len >> 16) & 0xff;
+  ba->data[msg_start + 1] = (msg_len >> 8) & 0xff;
+  ba->data[msg_start + 2] = msg_len & 0xff;
+
+  GST_DEBUG ("Sending onStatus: %u bytes (message length=%u)",
+      ba->len, msg_len);
+  gboolean ret = g_output_stream_write_all (client->output_stream, ba->data,
+      ba->len, &bytes_written, NULL, error);
+  g_byte_array_free (ba, TRUE);
+  return ret;
+}
+
+gboolean
 rtmp2_client_send_publish_result (Rtmp2Client * client, GError ** error)
 {
+  if (client->stream_id == 0)
+    client->stream_id = 1;
+
+  if (!rtmp2_client_send_user_control (client,
+          RTMP2_USER_CONTROL_STREAM_BEGIN, client->stream_id, error)) {
+    GST_WARNING ("Failed to send StreamBegin user control message");
+    return FALSE;
+  }
+
+  if (!rtmp2_client_send_on_status (client, 5, client->stream_id,
+          "status", "NetStream.Publish.Start",
+          "Publishing started.", error)) {
+    GST_WARNING ("Failed to send NetStream publish status");
+    return FALSE;
+  }
+
   client->state = RTMP2_CLIENT_STATE_PUBLISHING;
+  if (G_IS_OUTPUT_STREAM (client->output_stream)) {
+    g_output_stream_flush (client->output_stream, NULL, NULL);
+  }
   return TRUE;
 }
 
@@ -480,20 +1067,68 @@ rtmp2_client_parse_connect (Rtmp2Client * client, const guint8 * data,
 
   /* Parse Enhanced RTMP connect command */
   if (!rtmp2_enhanced_parse_connect (ptr, remaining, client->client_caps,
-          error)) {
+          &client->connect_transaction_id, error)) {
     return FALSE;
   }
 
   client->supports_amf3 = client->client_caps->supports_amf3;
+  client->server_caps->supports_amf3 = client->supports_amf3;
 
   if (src && src->application) {
     client->application = g_strdup (src->application);
   }
 
   client->connect_received = TRUE;
-  rtmp2_client_send_connect_result (client, error);
-  rtmp2_client_send_window_ack_size (client, 2500000, error);
-  rtmp2_client_send_peer_bandwidth (client, 2500000, error);
+  if (!rtmp2_client_send_connect_result (client, error)) {
+    GST_WARNING ("Failed to send connect result");
+    return FALSE;
+  }
+  /* Flush after connect result */
+  if (G_IS_OUTPUT_STREAM (client->output_stream)) {
+    g_output_stream_flush (client->output_stream, NULL, NULL);
+  }
+  
+  /* Send window ack size, peer bandwidth, and set chunk size first */
+  GST_DEBUG ("Sending window ack size");
+  if (!rtmp2_client_send_window_ack_size (client, 2500000, error)) {
+    GST_WARNING ("Failed to send window ack size: %s",
+        error && *error ? (*error)->message : "Unknown");
+  } else {
+    GST_DEBUG ("Window ack size sent successfully");
+  }
+  GST_DEBUG ("Sending peer bandwidth");
+  if (!rtmp2_client_send_peer_bandwidth (client, 2500000, error)) {
+    GST_WARNING ("Failed to send peer bandwidth: %s",
+        error && *error ? (*error)->message : "Unknown");
+  } else {
+    GST_DEBUG ("Peer bandwidth sent successfully");
+  }
+  GST_DEBUG ("Sending set chunk size");
+  if (!rtmp2_client_send_set_chunk_size (client, 4096, error)) {
+    GST_WARNING ("Failed to send set chunk size: %s",
+        error && *error ? (*error)->message : "Unknown");
+  } else {
+    GST_DEBUG ("Set chunk size sent successfully");
+  }
+  
+  /* Notify bandwidth check complete */
+  if (!rtmp2_client_send_on_bw_done (client, error)) {
+    GST_WARNING ("Failed to send onBWDone message");
+  }
+
+  /* Send onStatus message after all control messages */
+  if (!rtmp2_client_send_on_status (client, 3, 0,
+          "status", "NetConnection.Connect.Success",
+          "Connection succeeded.", error)) {
+    GST_WARNING ("Failed to send onStatus message");
+  } else {
+    GST_DEBUG ("onStatus sent successfully");
+  }
+  
+  /* Final flush */
+  if (G_IS_OUTPUT_STREAM (client->output_stream)) {
+    g_output_stream_flush (client->output_stream, NULL, NULL);
+  }
 
   return TRUE;
 }
@@ -511,7 +1146,9 @@ rtmp2_client_parse_publish (Rtmp2Client * client, const guint8 * data,
   }
 
   client->publish_received = TRUE;
-  rtmp2_client_send_publish_result (client, error);
+  if (!rtmp2_client_send_publish_result (client, error)) {
+    return FALSE;
+  }
 
   return TRUE;
 }

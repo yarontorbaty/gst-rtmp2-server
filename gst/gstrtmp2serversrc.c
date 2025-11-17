@@ -24,6 +24,7 @@
 
 #include "gstrtmp2server.h"
 #include "gstrtmp2serversrc.h"
+#include "rtmp2chunk.h"
 
 #include <string.h>
 #include <gio/gio.h>
@@ -137,6 +138,12 @@ gst_rtmp2_server_src_class_init (GstRtmp2ServerSrcClass * klass)
 
   GST_DEBUG_CATEGORY_INIT (gst_rtmp2_server_src_debug, "rtmp2serversrc",
       0, "RTMP2 Server Source element");
+  
+  /* Initialize client debug category */
+  rtmp2_client_debug_init ();
+  
+  /* Initialize chunk parser debug category */
+  rtmp2_chunk_debug_init ();
 }
 
 static void
@@ -164,6 +171,9 @@ gst_rtmp2_server_src_init (GstRtmp2ServerSrc * src)
   src->have_audio = FALSE;
   src->video_caps = NULL;
   src->audio_caps = NULL;
+
+  /* Mark as async source - we wait for client connections */
+  gst_base_src_set_async (GST_BASE_SRC (src), TRUE);
 }
 
 static void
@@ -298,6 +308,39 @@ gst_rtmp2_server_src_get_property (GObject * object, guint prop_id,
 }
 
 static gboolean
+client_read_cb (GPollableInputStream * stream, gpointer user_data)
+{
+  Rtmp2Client *client = (Rtmp2Client *) user_data;
+  GError *error = NULL;
+  GstRtmp2ServerSrc *src;
+
+  if (!client->user_data) {
+    GST_DEBUG ("Client has no user_data, removing source");
+    return G_SOURCE_REMOVE;
+  }
+
+  src = GST_RTMP2_SERVER_SRC (client->user_data);
+
+  GST_DEBUG_OBJECT (src, "Read callback triggered for client (state=%d)",
+      client->state);
+
+  if (!rtmp2_client_process_data (client, &error)) {
+    if (error) {
+      GST_WARNING_OBJECT (src, "Client processing error: %s", error->message);
+      g_error_free (error);
+    }
+    /* If client disconnected or errored, remove source */
+    if (client->state == RTMP2_CLIENT_STATE_DISCONNECTED ||
+        client->state == RTMP2_CLIENT_STATE_ERROR) {
+      GST_DEBUG_OBJECT (src, "Client disconnected/errored, removing read source");
+      return G_SOURCE_REMOVE;
+    }
+  }
+
+  return G_SOURCE_CONTINUE;
+}
+
+static gboolean
 server_accept_cb (GSocket * socket, GIOCondition condition, gpointer user_data)
 {
   GstRtmp2ServerSrc *src = GST_RTMP2_SERVER_SRC (user_data);
@@ -370,6 +413,19 @@ server_accept_cb (GSocket * socket, GIOCondition condition, gpointer user_data)
   client->timeout_seconds = src->timeout;
   client->user_data = src;
 
+  /* Set up read source for immediate data processing */
+  if (client->input_stream && G_IS_POLLABLE_INPUT_STREAM (client->input_stream)) {
+    GSource *read_source = g_pollable_input_stream_create_source (
+        G_POLLABLE_INPUT_STREAM (client->input_stream), NULL);
+    if (read_source) {
+      /* Create a wrapper function that returns gboolean for GSource callback */
+      g_source_set_callback (read_source,
+          (GSourceFunc) client_read_cb, client, NULL);
+      g_source_attach (read_source, src->context);
+      client->read_source = read_source;
+    }
+  }
+
   g_mutex_lock (&src->clients_lock);
   src->clients = g_list_append (src->clients, client);
   g_mutex_unlock (&src->clients_lock);
@@ -388,7 +444,8 @@ gst_rtmp2_server_src_start (GstBaseSrc * bsrc)
   GError *error = NULL;
   gboolean ret;
 
-  src->context = g_main_context_new ();
+  /* Use default main context - GStreamer will poll it */
+  src->context = g_main_context_default ();
 
   src->server_socket = g_socket_new (G_SOCKET_FAMILY_IPV4,
       G_SOCKET_TYPE_STREAM, G_SOCKET_PROTOCOL_TCP, &error);
@@ -474,10 +531,11 @@ gst_rtmp2_server_src_stop (GstBaseSrc * bsrc)
   src->active_client = NULL;
   g_mutex_unlock (&src->clients_lock);
 
-  if (src->context) {
+  /* Don't unref default context */
+  if (src->context && src->context != g_main_context_default ()) {
     g_main_context_unref (src->context);
-    src->context = NULL;
   }
+  src->context = NULL;
 
   return TRUE;
 }
@@ -492,6 +550,8 @@ gst_rtmp2_server_src_create (GstPushSrc * psrc, GstBuffer ** buf)
   GList *flv_tags = NULL;
   Rtmp2FlvTag *tag;
   GstCaps *caps;
+  gint retry_count = 0;
+  const gint max_retries = 100;  /* Wait up to 1 second (100 * 10ms) */
 
   /* Process pending events in main context */
   while (g_main_context_pending (src->context)) {
@@ -570,16 +630,30 @@ gst_rtmp2_server_src_create (GstPushSrc * psrc, GstBuffer ** buf)
       } else {
         rtmp2_flv_tag_free (tag);
         g_list_free (flv_tags);
+        /* No data in tag, wait a bit */
+        g_mutex_unlock (&src->clients_lock);
+        g_usleep (10000);
+        g_mutex_lock (&src->clients_lock);
+        /* Return empty buffer to keep pipeline going */
+        *buf = gst_buffer_new ();
         ret = GST_FLOW_OK;
       }
     } else {
-      /* No data available, wait a bit */
+      /* No data available yet, wait a bit */
+      g_mutex_unlock (&src->clients_lock);
       g_usleep (10000);  /* 10ms */
+      g_mutex_lock (&src->clients_lock);
+      /* Return empty buffer to keep pipeline going */
+      *buf = gst_buffer_new ();
       ret = GST_FLOW_OK;
     }
   } else {
-    /* No active client, wait a bit */
+    /* No active client yet - wait a bit before returning */
+    g_mutex_unlock (&src->clients_lock);
     g_usleep (10000);  /* 10ms */
+    g_mutex_lock (&src->clients_lock);
+    /* Return empty buffer to keep pipeline going while waiting */
+    *buf = gst_buffer_new ();
     ret = GST_FLOW_OK;
   }
 

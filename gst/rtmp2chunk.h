@@ -93,6 +93,8 @@ gboolean rtmp2_chunk_parser_process (Rtmp2ChunkParser *parser, const guint8 *dat
 Rtmp2ChunkMessage *rtmp2_chunk_message_new (void);
 void rtmp2_chunk_message_free (Rtmp2ChunkMessage *msg);
 
+void rtmp2_chunk_debug_init (void);
+
 G_END_DECLS
 
 #endif /* __RTMP2_CHUNK_H__ */

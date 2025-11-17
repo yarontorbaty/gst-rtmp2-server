@@ -54,13 +54,15 @@ typedef struct _Rtmp2Client {
   Rtmp2ChunkParser chunk_parser;
   Rtmp2FlvParser flv_parser;
   
-  gchar *application;
-  gchar *stream_key;
-  gchar *tc_url;
-  
-  gboolean handshake_complete;
-  gboolean connect_received;
-  gboolean publish_received;
+      gchar *application;
+      gchar *stream_key;
+      gchar *tc_url;
+      
+      gdouble connect_transaction_id;
+      
+      gboolean handshake_complete;
+      gboolean connect_received;
+      gboolean publish_received;
   
   /* Enhanced RTMP support */
   Rtmp2EnhancedCapabilities *client_caps;
@@ -70,6 +72,7 @@ typedef struct _Rtmp2Client {
   
   guint64 last_activity;
   guint timeout_seconds;
+  guint32 stream_id;
   
   gpointer user_data;
 } Rtmp2Client;
@@ -77,12 +80,18 @@ typedef struct _Rtmp2Client {
 Rtmp2Client *rtmp2_client_new (GSocketConnection *connection, GIOStream *io_stream);
 void rtmp2_client_free (Rtmp2Client *client);
 gboolean rtmp2_client_process_data (Rtmp2Client *client, GError **error);
+
+void rtmp2_client_debug_init (void);
 gboolean rtmp2_client_send_handshake (Rtmp2Client *client, GError **error);
 gboolean rtmp2_client_send_ack (Rtmp2Client *client, guint32 bytes, GError **error);
 gboolean rtmp2_client_send_window_ack_size (Rtmp2Client *client, guint32 size, GError **error);
 gboolean rtmp2_client_send_peer_bandwidth (Rtmp2Client *client, guint32 size, GError **error);
 gboolean rtmp2_client_send_connect_result (Rtmp2Client *client, GError **error);
+gboolean rtmp2_client_send_on_status (Rtmp2Client *client, guint8 chunk_stream_id, guint32 message_stream_id, const gchar *level, const gchar *code, const gchar *description, GError **error);
+gboolean rtmp2_client_send_create_stream_result (Rtmp2Client *client, gdouble transaction_id, GError **error);
 gboolean rtmp2_client_send_publish_result (Rtmp2Client *client, GError **error);
+gboolean rtmp2_client_send_release_stream_result (Rtmp2Client *client, gdouble transaction_id, GError **error);
+gboolean rtmp2_client_send_on_fc_publish (Rtmp2Client *client, const gchar *stream_name, GError **error);
 gboolean rtmp2_client_parse_connect (Rtmp2Client *client, const guint8 *data, gsize size, GError **error);
 gboolean rtmp2_client_parse_publish (Rtmp2Client *client, const guint8 *data, gsize size, GError **error);
 

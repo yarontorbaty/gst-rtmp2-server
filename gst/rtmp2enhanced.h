@@ -63,9 +63,9 @@ typedef struct {
 Rtmp2EnhancedCapabilities *rtmp2_enhanced_capabilities_new (void);
 void rtmp2_enhanced_capabilities_free (Rtmp2EnhancedCapabilities * caps);
 gboolean rtmp2_enhanced_parse_connect (const guint8 * data, gsize size,
-    Rtmp2EnhancedCapabilities * client_caps, GError ** error);
+    Rtmp2EnhancedCapabilities * client_caps, gdouble * transaction_id, GError ** error);
 gboolean rtmp2_enhanced_send_connect_result (GByteArray * ba,
-    Rtmp2EnhancedCapabilities * server_caps, GError ** error);
+    Rtmp2EnhancedCapabilities * server_caps, gdouble transaction_id, GError ** error);
 
 G_END_DECLS
 
