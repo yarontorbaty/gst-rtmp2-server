@@ -78,6 +78,7 @@ struct _GstRtmp2ServerSrc {
   gboolean have_audio;
   GstCaps *video_caps;
   GstCaps *audio_caps;
+  gboolean sent_flv_header;
 };
 
 struct _GstRtmp2ServerSrcClass {

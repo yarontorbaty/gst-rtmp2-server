@@ -171,6 +171,7 @@ gst_rtmp2_server_src_init (GstRtmp2ServerSrc * src)
   src->have_audio = FALSE;
   src->video_caps = NULL;
   src->audio_caps = NULL;
+  src->sent_flv_header = FALSE;
 
   /* Configure as live async source - we wait for client connections and stream in real-time */
   gst_base_src_set_live (GST_BASE_SRC (src), TRUE);
@@ -461,7 +462,7 @@ gst_rtmp2_server_src_start (GstBaseSrc * bsrc)
   g_source_attach (src->server_source, src->context);
 
   /* Set caps early for proper negotiation */
-  GstCaps *caps = gst_caps_new_simple ("video/x-flv", NULL);
+  GstCaps *caps = gst_caps_new_empty_simple ("video/x-flv");
   gst_base_src_set_caps (GST_BASE_SRC (src), caps);
   gst_caps_unref (caps);
 
@@ -495,6 +496,7 @@ gst_rtmp2_server_src_stop (GstBaseSrc * bsrc)
   g_list_free (src->clients);
   src->clients = NULL;
   src->active_client = NULL;
+  src->sent_flv_header = FALSE;
   g_mutex_unlock (&src->clients_lock);
 
   /* Don't unref default context */
@@ -514,7 +516,35 @@ gst_rtmp2_server_src_create (GstPushSrc * psrc, GstBuffer ** buf)
   GList *l;
   GList *flv_tags = NULL;
   Rtmp2FlvTag *tag;
-  GstCaps *caps;
+
+  /* Send FLV header as the very first buffer */
+  if (!src->sent_flv_header) {
+    /* FLV file header: 13 bytes total */
+    /* 'FLV' signature + version + flags + header size + previous tag size 0 */
+    static const guint8 flv_header[13] = {
+      'F', 'L', 'V',        /* Signature */
+      0x01,                 /* Version 1 */
+      0x05,                 /* Flags: audio (0x04) + video (0x01) */
+      0x00, 0x00, 0x00, 0x09, /* Header size: 9 bytes */
+      0x00, 0x00, 0x00, 0x00  /* Previous tag size 0 (for first tag) */
+    };
+    
+    *buf = gst_buffer_new_allocate (NULL, 13, NULL);
+    GstMapInfo map;
+    if (gst_buffer_map (*buf, &map, GST_MAP_WRITE)) {
+      memcpy (map.data, flv_header, 13);
+      gst_buffer_unmap (*buf, &map);
+      src->sent_flv_header = TRUE;
+      GST_INFO_OBJECT (src, "Sent FLV file header (13 bytes)");
+      GST_BUFFER_PTS (*buf) = 0;
+      GST_BUFFER_DTS (*buf) = 0;
+      return GST_FLOW_OK;
+    } else {
+      gst_buffer_unref (*buf);
+      GST_ERROR_OBJECT (src, "Failed to map FLV header buffer");
+      return GST_FLOW_ERROR;
+    }
+  }
 
   /* Process pending accept events */
   while (g_main_context_pending (src->context)) {
@@ -526,10 +556,12 @@ gst_rtmp2_server_src_create (GstPushSrc * psrc, GstBuffer ** buf)
   gint client_count = g_list_length (src->clients);
   GST_DEBUG_OBJECT (src, "Processing %d clients in create", client_count);
 
-  /* Process all clients with non-blocking reads */
+  /* Process all clients - read multiple times to drain socket buffers */
   for (l = src->clients; l; l = l->next) {
     Rtmp2Client *client = (Rtmp2Client *) l->data;
     GError *error = NULL;
+    gint read_attempts = 0;
+    const gint max_reads = 50; /* Read up to 50 times (50 * 4KB = 200KB buffer drain) */
 
     GST_DEBUG_OBJECT (src, "Client state=%d, handshake_complete=%d",
         client->state, client->handshake_complete);
@@ -540,20 +572,26 @@ gst_rtmp2_server_src_create (GstPushSrc * psrc, GstBuffer ** buf)
       continue;
     }
 
-    /* Try to process client data once per create cycle */
-    GST_DEBUG_OBJECT (src, "Calling rtmp2_client_process_data");
-    gboolean processed = rtmp2_client_process_data (client, &error);
-    
-    if (error) {
-      /* Real error occurred */
-      GST_WARNING_OBJECT (src, "Client error: %s", error->message);
-      g_error_free (error);
-      error = NULL;
-    }
+    /* Read multiple times to drain socket buffer */
+    for (read_attempts = 0; read_attempts < max_reads; read_attempts++) {
+      gboolean processed = rtmp2_client_process_data (client, &error);
+      
+      if (error) {
+        /* Real error occurred */
+        GST_WARNING_OBJECT (src, "Client error: %s", error->message);
+        g_error_free (error);
+        error = NULL;
+        break;
+      }
 
-    if (!processed && (client->state == RTMP2_CLIENT_STATE_DISCONNECTED ||
-                       client->state == RTMP2_CLIENT_STATE_ERROR)) {
-      GST_DEBUG_OBJECT (src, "Client disconnected or errored");
+      if (!processed) {
+        /* No more data available or client disconnected */
+        if (client->state == RTMP2_CLIENT_STATE_DISCONNECTED ||
+            client->state == RTMP2_CLIENT_STATE_ERROR) {
+          GST_DEBUG_OBJECT (src, "Client disconnected or errored");
+        }
+        break; /* Stop reading this client */
+      }
     }
 
     /* If client is publishing, make it active */
@@ -564,66 +602,105 @@ gst_rtmp2_server_src_create (GstPushSrc * psrc, GstBuffer ** buf)
     }
   }
 
-  /* Get data from active client */
-  if (src->active_client && src->active_client->state == RTMP2_CLIENT_STATE_PUBLISHING) {
-    /* Check for FLV tags in the parser */
-    flv_tags = src->active_client->flv_parser.pending_tags;
-    gint pending_count = g_list_length (flv_tags);
-    if (pending_count > 0) {
-      GST_DEBUG_OBJECT (src, "Found %d pending FLV tags", pending_count);
+  /* Try to get data from active client - be patient and wait for real data */
+  gint retry_count = 0;
+  /* Wait longer - up to 30 seconds for client connection and first data */
+  const gint max_retries = 3000; /* 30 seconds (3000 * 10ms) */
+  
+  while (retry_count < max_retries) {
+    if (retry_count % 100 == 0) {
+      GST_DEBUG_OBJECT (src, "Retry %d: active_client=%p, client_count=%d", 
+          retry_count, src->active_client, g_list_length(src->clients));
     }
     
-    if (flv_tags) {
-      tag = (Rtmp2FlvTag *) flv_tags->data;
-      src->active_client->flv_parser.pending_tags =
-          g_list_remove_link (src->active_client->flv_parser.pending_tags,
-          flv_tags);
-
-      if (tag->data && gst_buffer_get_size (tag->data) > 0) {
-        gsize buf_size = gst_buffer_get_size (tag->data);
-        GST_INFO_OBJECT (src, "Returning FLV tag with %zu bytes (type=%d)", 
-            buf_size, tag->tag_type);
-        *buf = gst_buffer_ref (tag->data);
-
-        /* Set timestamp */
-        GST_BUFFER_PTS (*buf) = tag->timestamp * GST_MSECOND;
-        GST_BUFFER_DTS (*buf) = GST_BUFFER_PTS (*buf);
-
-        rtmp2_flv_tag_free (tag);
-        g_list_free (flv_tags);
-        ret = GST_FLOW_OK;
-      } else {
-        rtmp2_flv_tag_free (tag);
-        g_list_free (flv_tags);
-        /* No data in tag, wait a bit */
-        g_mutex_unlock (&src->clients_lock);
-        g_usleep (10000);
-        g_mutex_lock (&src->clients_lock);
-        /* Return empty buffer to keep pipeline going */
-        *buf = gst_buffer_new ();
-        ret = GST_FLOW_OK;
+    if (src->active_client && src->active_client->state == RTMP2_CLIENT_STATE_PUBLISHING) {
+      /* Check for FLV tags in the parser */
+      flv_tags = src->active_client->flv_parser.pending_tags;
+      gint pending_count = g_list_length (flv_tags);
+      if (pending_count > 0) {
+        GST_INFO_OBJECT (src, "Found %d pending FLV tags", pending_count);
+      } else if (retry_count % 100 == 0) {
+        GST_DEBUG_OBJECT (src, "Waiting for FLV tags... (retry %d, active_client=%p, state=%d)", 
+            retry_count, src->active_client, src->active_client ? src->active_client->state : -1);
       }
-    } else {
-      /* No data available yet, wait a bit */
-      g_mutex_unlock (&src->clients_lock);
-      g_usleep (10000);  /* 10ms */
-      g_mutex_lock (&src->clients_lock);
-      /* Return empty buffer to keep pipeline going */
-      *buf = gst_buffer_new ();
-      ret = GST_FLOW_OK;
+      
+      if (flv_tags) {
+        tag = (Rtmp2FlvTag *) flv_tags->data;
+        src->active_client->flv_parser.pending_tags =
+            g_list_remove_link (src->active_client->flv_parser.pending_tags,
+            flv_tags);
+
+        if (tag->data && gst_buffer_get_size (tag->data) > 0) {
+          gsize buf_size = gst_buffer_get_size (tag->data);
+          GST_INFO_OBJECT (src, "Returning FLV tag with %zu bytes (type=%d)", 
+              buf_size, tag->tag_type);
+          *buf = gst_buffer_ref (tag->data);
+
+          /* Set timestamp */
+          GST_BUFFER_PTS (*buf) = tag->timestamp * GST_MSECOND;
+          GST_BUFFER_DTS (*buf) = GST_BUFFER_PTS (*buf);
+
+          rtmp2_flv_tag_free (tag);
+          g_list_free (flv_tags);
+          ret = GST_FLOW_OK;
+          g_mutex_unlock (&src->clients_lock);
+          return ret;  /* Return immediately with data */
+        } else {
+          /* Empty tag - skip it and continue waiting */
+          rtmp2_flv_tag_free (tag);
+          g_list_free (flv_tags);
+        }
+      }
     }
-  } else {
-    /* No active client yet - wait a bit before returning */
+    
+    /* No data available - unlock, process events, sleep, then retry */
     g_mutex_unlock (&src->clients_lock);
+    
+    /* Process any pending network events */
+    while (g_main_context_pending (src->context)) {
+      g_main_context_iteration (src->context, FALSE);
+    }
+    
     g_usleep (10000);  /* 10ms */
+    retry_count++;
+    
     g_mutex_lock (&src->clients_lock);
-    /* Return empty buffer to keep pipeline going while waiting */
-    *buf = gst_buffer_new ();
-    ret = GST_FLOW_OK;
+    
+    /* Reprocess clients to get new data - drain socket buffers */
+    for (l = src->clients; l; l = l->next) {
+      Rtmp2Client *client = (Rtmp2Client *) l->data;
+      GError *error = NULL;
+      gint read_attempts = 0;
+      const gint max_reads = 50; /* Read up to 50 times per cycle */
+      
+      if (client->state != RTMP2_CLIENT_STATE_DISCONNECTED &&
+          client->state != RTMP2_CLIENT_STATE_ERROR) {
+        /* Read multiple times to drain socket buffer */
+        for (read_attempts = 0; read_attempts < max_reads; read_attempts++) {
+          gboolean processed = rtmp2_client_process_data (client, &error);
+          if (error) {
+            g_error_free (error);
+            error = NULL;
+            break; /* Stop on error */
+          }
+          if (!processed) {
+            break; /* Stop if no more data */
+          }
+        }
+        
+        /* Check if this client started publishing and should become active */
+        if (client->state == RTMP2_CLIENT_STATE_PUBLISHING &&
+            !src->active_client) {
+          src->active_client = client;
+          GST_INFO_OBJECT (src, "Client started publishing (detected in retry loop)");
+        }
+      }
+    }
   }
 
+  /* Timeout after 30 seconds - likely no client or stream ended */
+  GST_WARNING_OBJECT (src, "No data after %d retries (30 seconds)", max_retries);
   g_mutex_unlock (&src->clients_lock);
-
-  return ret;
+  return GST_FLOW_EOS; /* Signal end of stream */
 }
 
