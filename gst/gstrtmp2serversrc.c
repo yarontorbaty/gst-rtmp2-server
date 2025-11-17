@@ -176,6 +176,13 @@ gst_rtmp2_server_src_init (GstRtmp2ServerSrc * src)
   gst_base_src_set_live (GST_BASE_SRC (src), TRUE);
   gst_base_src_set_format (GST_BASE_SRC (src), GST_FORMAT_TIME);
   gst_base_src_set_do_timestamp (GST_BASE_SRC (src), TRUE);
+  
+  /* Set caps to video/x-flv for FLV tag output */
+  GstCaps *flv_caps = gst_caps_new_simple ("video/x-flv",
+      "streamheader", GST_TYPE_BUFFER, NULL,
+      NULL);
+  gst_base_src_set_caps (GST_BASE_SRC (src), flv_caps);
+  gst_caps_unref (flv_caps);
 }
 
 static void
@@ -574,8 +581,10 @@ gst_rtmp2_server_src_create (GstPushSrc * psrc, GstBuffer ** buf)
           g_list_remove_link (src->active_client->flv_parser.pending_tags,
           flv_tags);
 
-      if (tag->data) {
-        GST_INFO_OBJECT (src, "Returning FLV tag with %zu bytes", gst_buffer_get_size (tag->data));
+      if (tag->data && gst_buffer_get_size (tag->data) > 0) {
+        gsize buf_size = gst_buffer_get_size (tag->data);
+        GST_INFO_OBJECT (src, "Returning FLV tag with %zu bytes (type=%d)", 
+            buf_size, tag->tag_type);
         *buf = gst_buffer_ref (tag->data);
 
         /* Set caps if not already set */

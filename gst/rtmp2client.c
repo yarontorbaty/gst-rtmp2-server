@@ -869,29 +869,72 @@ rtmp2_client_process_data (Rtmp2Client * client, GError ** error)
 
       case RTMP2_MESSAGE_VIDEO:
       case RTMP2_MESSAGE_AUDIO:
-        GST_INFO ("Processing %s message (type=%d, length=%u, state=%d)",
+        GST_DEBUG ("Processing %s message (type=%d, length=%u, state=%d)",
             msg->message_type == RTMP2_MESSAGE_VIDEO ? "video" : "audio",
             msg->message_type, msg->message_length, client->state);
         if (client->state == RTMP2_CLIENT_STATE_PUBLISHING) {
-          GstMapInfo map;
-          GList *new_tags = NULL;
-          if (gst_buffer_map (msg->buffer, &map, GST_MAP_READ)) {
-            GError *flv_error = NULL;
-            GST_INFO ("Calling FLV parser with %zu bytes", map.size);
-            rtmp2_flv_parser_process (&client->flv_parser, map.data, map.size,
-                &new_tags, &flv_error);
-            if (flv_error) {
-              GST_INFO ("FLV parser error: %s (continuing)", flv_error->message);
-              g_clear_error (&flv_error);
-            }
-            if (new_tags) {
-              GST_INFO ("FLV parser created %d tags, adding to pending", g_list_length (new_tags));
-              client->flv_parser.pending_tags =
-                  g_list_concat (client->flv_parser.pending_tags, new_tags);
-            } else {
-              GST_INFO ("FLV parser created no tags");
-            }
-            gst_buffer_unmap (msg->buffer, &map);
+          /* Create FLV tag from RTMP message data */
+          /* RTMP video/audio messages contain FLV tag body (without 11-byte header) */
+          /* We need to reconstruct the full FLV tag for downstream elements */
+          
+          GstBuffer *flv_tag_buffer = gst_buffer_new_allocate (NULL, 11 + msg->message_length + 4, NULL);
+          GstMapInfo tag_map, msg_map;
+          
+          if (gst_buffer_map (flv_tag_buffer, &tag_map, GST_MAP_WRITE) &&
+              gst_buffer_map (msg->buffer, &msg_map, GST_MAP_READ)) {
+            
+            guint8 *ptr = tag_map.data;
+            
+            /* FLV tag header (11 bytes) */
+            *ptr++ = msg->message_type; /* Tag type: 8=audio, 9=video */
+            
+            /* Data size (24-bit big-endian) */
+            *ptr++ = (msg->message_length >> 16) & 0xff;
+            *ptr++ = (msg->message_length >> 8) & 0xff;
+            *ptr++ = msg->message_length & 0xff;
+            
+            /* Timestamp (24-bit big-endian) + extended timestamp */
+            guint32 ts = msg->timestamp;
+            *ptr++ = (ts >> 16) & 0xff;
+            *ptr++ = (ts >> 8) & 0xff;
+            *ptr++ = ts & 0xff;
+            *ptr++ = (ts >> 24) & 0xff; /* Extended timestamp */
+            
+            /* Stream ID (24-bit, always 0) */
+            *ptr++ = 0;
+            *ptr++ = 0;
+            *ptr++ = 0;
+            
+            /* Copy tag body data */
+            memcpy (ptr, msg_map.data, msg->message_length);
+            ptr += msg->message_length;
+            
+            /* Previous tag size (32-bit big-endian) */
+            guint32 prev_tag_size = 11 + msg->message_length;
+            *ptr++ = (prev_tag_size >> 24) & 0xff;
+            *ptr++ = (prev_tag_size >> 16) & 0xff;
+            *ptr++ = (prev_tag_size >> 8) & 0xff;
+            *ptr++ = prev_tag_size & 0xff;
+            
+            gst_buffer_unmap (msg->buffer, &msg_map);
+            gst_buffer_unmap (flv_tag_buffer, &tag_map);
+            
+            /* Create FLV tag wrapper and add to pending */
+            Rtmp2FlvTag *tag = g_new0 (Rtmp2FlvTag, 1);
+            tag->tag_type = msg->message_type == RTMP2_MESSAGE_VIDEO ? 
+                RTMP2_FLV_TAG_VIDEO : RTMP2_FLV_TAG_AUDIO;
+            tag->timestamp = msg->timestamp;
+            tag->data_size = 11 + msg->message_length + 4;
+            tag->data = flv_tag_buffer; /* Transfer ownership */
+            
+            client->flv_parser.pending_tags = 
+                g_list_append (client->flv_parser.pending_tags, tag);
+            
+            GST_DEBUG ("Created FLV tag: type=%s, size=%u, timestamp=%u",
+                tag->tag_type == RTMP2_FLV_TAG_VIDEO ? "video" : "audio",
+                tag->data_size, tag->timestamp);
+          } else {
+            gst_buffer_unref (flv_tag_buffer);
           }
         } else {
           GST_WARNING ("Received media but state is not PUBLISHING (state=%d)", client->state);
