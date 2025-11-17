@@ -315,7 +315,12 @@ gboolean
 rtmp2_amf0_write_object_property (GByteArray * ba, const gchar * name,
     const gchar * value)
 {
+  /* Write property name (no type marker for keys in objects) */
   rtmp2_amf0_write_string (ba, name);
+  
+  /* Write property value WITH type marker (AMF0_STRING) */
+  guint8 amf0_string = RTMP2_AMF0_STRING;
+  g_byte_array_append (ba, &amf0_string, 1);
   rtmp2_amf0_write_string (ba, value);
   return TRUE;
 }

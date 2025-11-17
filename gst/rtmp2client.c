@@ -709,10 +709,13 @@ rtmp2_client_process_data (Rtmp2Client * client, GError ** error)
                   GST_INFO ("Received command: %s (connect=%d, publish=%d)",
                       cmd_name, client->connect_received, client->publish_received);
                   
-                  if (g_strcmp0 (cmd_name, "publish") == 0) {
-                    GST_DEBUG ("Parsing publish command");
+                  gint publish_cmp = g_strcmp0 (cmd_name, "publish");
+                  GST_INFO ("Comparing cmd_name='%s' with 'publish': result=%d", cmd_name, publish_cmp);
+                  
+                  if (publish_cmp == 0) {
+                    GST_INFO ("Handling publish command");
                     if (rtmp2_client_parse_publish (client, cmd_data, cmd_size, error)) {
-                      GST_DEBUG ("Publish command parsed successfully, state=%d", client->state);
+                      GST_INFO ("Publish command parsed successfully, state=%d, client now publishing", client->state);
                     } else {
                       GST_WARNING ("Failed to parse publish command: %s",
                           error && *error ? (*error)->message : "Unknown");
@@ -804,11 +807,12 @@ rtmp2_client_process_data (Rtmp2Client * client, GError ** error)
                     if (rtmp2_amf0_parse (&cmd_ptr, &cmd_remaining, &txn_value, NULL)) {
                       rtmp2_amf_value_free (&txn_value);
                     }
+                    GST_INFO ("Sending createStream result (txn=%.0f)", transaction_id);
                     if (!rtmp2_client_send_create_stream_result (client, transaction_id, error)) {
                       GST_WARNING ("Failed to send createStream result");
                     } else {
                       client->stream_id = 1;
-                      GST_DEBUG ("createStream result sent successfully (transaction_id=%f)", transaction_id);
+                      GST_INFO ("createStream result sent successfully (stream_id=%d)", client->stream_id);
                     }
                   } else if (g_strcmp0 (cmd_name, "_checkbw") == 0 ||
                       g_strcmp0 (cmd_name, "checkbw") == 0) {
@@ -870,8 +874,13 @@ rtmp2_client_process_data (Rtmp2Client * client, GError ** error)
           GstMapInfo map;
           GList *new_tags = NULL;
           if (gst_buffer_map (msg->buffer, &map, GST_MAP_READ)) {
+            GError *flv_error = NULL;
             rtmp2_flv_parser_process (&client->flv_parser, map.data, map.size,
-                &new_tags, error);
+                &new_tags, &flv_error);
+            if (flv_error) {
+              GST_DEBUG ("FLV parser: %s (continuing)", flv_error->message);
+              g_clear_error (&flv_error);
+            }
             if (new_tags) {
               client->flv_parser.pending_tags =
                   g_list_concat (client->flv_parser.pending_tags, new_tags);
