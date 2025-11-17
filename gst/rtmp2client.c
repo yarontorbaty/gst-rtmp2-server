@@ -460,7 +460,7 @@ rtmp2_client_send_handshake (Rtmp2Client * client, GError ** error)
 gboolean
 rtmp2_client_process_data (Rtmp2Client * client, GError ** error)
 {
-  guint8 buffer[4096];
+  guint8 buffer[16384];  /* Increased from 4KB to 16KB for better throughput */
   gssize bytes_read;
   GList *messages = NULL;
   GList *l;
@@ -607,9 +607,9 @@ rtmp2_client_process_data (Rtmp2Client * client, GError ** error)
   if (bytes_read < 0) {
     /* Check if it's WOULD_BLOCK (no data available yet) */
     if (error && *error && g_error_matches (*error, G_IO_ERROR, G_IO_ERROR_WOULD_BLOCK)) {
-      GST_DEBUG ("No data available (WOULD_BLOCK), returning TRUE to try later");
+      GST_DEBUG ("No data available (WOULD_BLOCK), returning FALSE to avoid spinning");
       g_clear_error (error);
-      return TRUE;
+      return FALSE;  /* No data - let caller's adaptive sleep handle retry timing */
     }
     GST_WARNING ("Failed to read chunk data: %s",
         error && *error ? (*error)->message : "Unknown");

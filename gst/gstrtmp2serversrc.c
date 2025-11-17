@@ -27,6 +27,7 @@
 #include "rtmp2chunk.h"
 
 #include <string.h>
+#include <sys/socket.h>
 #include <gio/gio.h>
 #include <gio/giotypes.h>
 
@@ -331,6 +332,17 @@ server_accept_cb (GSocket * socket, GIOCondition condition, gpointer user_data)
   /* Set client socket to non-blocking for async I/O */
   g_socket_set_blocking (client_socket, FALSE);
 
+  /* Increase socket receive buffer to prevent kernel-level drops during streaming */
+  /* 256KB buffer can hold ~16 video frames worth of data */
+  if (!g_socket_set_option (client_socket, SOL_SOCKET, SO_RCVBUF, 262144, &error)) {
+    GST_WARNING_OBJECT (src, "Failed to set SO_RCVBUF: %s",
+        error ? error->message : "Unknown error");
+    g_clear_error (&error);
+    /* Non-fatal, continue anyway */
+  } else {
+    GST_DEBUG_OBJECT (src, "Set socket receive buffer to 256KB");
+  }
+
   connection = g_socket_connection_factory_create_connection (client_socket);
   g_object_unref (client_socket);
 
@@ -561,7 +573,7 @@ gst_rtmp2_server_src_create (GstPushSrc * psrc, GstBuffer ** buf)
     Rtmp2Client *client = (Rtmp2Client *) l->data;
     GError *error = NULL;
     gint read_attempts = 0;
-    const gint max_reads = 50; /* Read up to 50 times (50 * 4KB = 200KB buffer drain) */
+    const gint max_reads = 100; /* Read up to 100 times (100 * 16KB = 1.6MB burst capacity) */
 
     GST_DEBUG_OBJECT (src, "Client state=%d, handshake_complete=%d",
         client->state, client->handshake_complete);
@@ -572,7 +584,7 @@ gst_rtmp2_server_src_create (GstPushSrc * psrc, GstBuffer ** buf)
       continue;
     }
 
-    /* Read multiple times to drain socket buffer */
+    /* Read multiple times to drain socket buffer aggressively */
     for (read_attempts = 0; read_attempts < max_reads; read_attempts++) {
       gboolean processed = rtmp2_client_process_data (client, &error);
       
@@ -604,8 +616,8 @@ gst_rtmp2_server_src_create (GstPushSrc * psrc, GstBuffer ** buf)
 
   /* Try to get data from active client - be patient and wait for real data */
   gint retry_count = 0;
-  /* Wait longer - up to 30 seconds for client connection and first data */
-  const gint max_retries = 3000; /* 30 seconds (3000 * 10ms) */
+  /* Wait longer - up to 60 seconds for client connection and first data */
+  const gint max_retries = 60000; /* 60 seconds (enough time even with minimal sleep) */
   
   while (retry_count < max_retries) {
     if (retry_count % 100 == 0) {
@@ -661,7 +673,17 @@ gst_rtmp2_server_src_create (GstPushSrc * psrc, GstBuffer ** buf)
       g_main_context_iteration (src->context, FALSE);
     }
     
-    g_usleep (10000);  /* 10ms */
+    /* Adaptive sleep - minimal during active streaming to maximize frame capture */
+    if (src->active_client && src->active_client->state == RTMP2_CLIENT_STATE_PUBLISHING) {
+      /* Client is actively publishing - tiny sleep to avoid spinning but maximize throughput */
+      g_usleep (100);  /* 100μs = 0.1ms, fast enough for 30fps (33ms per frame) */
+    } else if (retry_count < 100) {
+      /* Waiting for connection: minimal sleep */
+      g_usleep (1000);  /* 1ms */
+    } else {
+      /* Extended wait: longer sleep to reduce CPU */
+      g_usleep (10000);  /* 10ms */
+    }
     retry_count++;
     
     g_mutex_lock (&src->clients_lock);
@@ -671,7 +693,7 @@ gst_rtmp2_server_src_create (GstPushSrc * psrc, GstBuffer ** buf)
       Rtmp2Client *client = (Rtmp2Client *) l->data;
       GError *error = NULL;
       gint read_attempts = 0;
-      const gint max_reads = 50; /* Read up to 50 times per cycle */
+      const gint max_reads = 100; /* Read up to 100 times per cycle - balanced throughput/responsiveness */
       
       if (client->state != RTMP2_CLIENT_STATE_DISCONNECTED &&
           client->state != RTMP2_CLIENT_STATE_ERROR) {
@@ -698,8 +720,8 @@ gst_rtmp2_server_src_create (GstPushSrc * psrc, GstBuffer ** buf)
     }
   }
 
-  /* Timeout after 30 seconds - likely no client or stream ended */
-  GST_WARNING_OBJECT (src, "No data after %d retries (30 seconds)", max_retries);
+  /* Timeout after 60 seconds - likely no client or stream ended */
+  GST_WARNING_OBJECT (src, "No data after %d retries (60 seconds)", max_retries);
   g_mutex_unlock (&src->clients_lock);
   return GST_FLOW_EOS; /* Signal end of stream */
 }
