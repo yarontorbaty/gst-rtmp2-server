@@ -80,6 +80,7 @@ typedef struct _Rtmp2Client {
 Rtmp2Client *rtmp2_client_new (GSocketConnection *connection, GIOStream *io_stream);
 void rtmp2_client_free (Rtmp2Client *client);
 gboolean rtmp2_client_process_data (Rtmp2Client *client, GError **error);
+gboolean rtmp2_client_start_reading (Rtmp2Client *client, GMainContext *context);
 
 void rtmp2_client_debug_init (void);
 gboolean rtmp2_client_send_handshake (Rtmp2Client *client, GError **error);

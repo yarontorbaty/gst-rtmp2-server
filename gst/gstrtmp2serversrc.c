@@ -403,6 +403,7 @@ server_accept_cb (GSocket * socket, GIOCondition condition, gpointer user_data)
   gint client_count = g_list_length (src->clients);
   g_mutex_unlock (&src->clients_lock);
 
+  /* Note: Async reading will be started after handshake completes */
   GST_INFO_OBJECT (src, "New client connected%s (total clients: %d)",
       src->tls ? " (TLS)" : "", client_count);
 
@@ -558,57 +559,47 @@ gst_rtmp2_server_src_create (GstPushSrc * psrc, GstBuffer ** buf)
     }
   }
 
-  /* Process pending accept events */
+  /* Process pending I/O events (triggers async read callbacks) */
   while (g_main_context_pending (src->context)) {
     g_main_context_iteration (src->context, FALSE);
   }
 
   g_mutex_lock (&src->clients_lock);
 
-  gint client_count = g_list_length (src->clients);
-  GST_DEBUG_OBJECT (src, "Processing %d clients in create", client_count);
-
-  /* Process all clients - read multiple times to drain socket buffers */
+  /* Process handshake for clients that haven't completed it yet */
+  /* Once handshake completes, async reading will take over */
   for (l = src->clients; l; l = l->next) {
     Rtmp2Client *client = (Rtmp2Client *) l->data;
-    GError *error = NULL;
-    gint read_attempts = 0;
-    const gint max_reads = 100; /* Read up to 100 times (100 * 16KB = 1.6MB burst capacity) */
-
-    GST_DEBUG_OBJECT (src, "Client state=%d, handshake_complete=%d",
-        client->state, client->handshake_complete);
-
-    if (client->state == RTMP2_CLIENT_STATE_DISCONNECTED ||
-        client->state == RTMP2_CLIENT_STATE_ERROR) {
-      GST_DEBUG_OBJECT (src, "Skipping disconnected/errored client");
-      continue;
-    }
-
-    /* Read multiple times to drain socket buffer aggressively */
-    for (read_attempts = 0; read_attempts < max_reads; read_attempts++) {
-      gboolean processed = rtmp2_client_process_data (client, &error);
+    
+    /* Only manually process handshake - async reading handles post-handshake */
+    if (!client->handshake_complete && 
+        client->state != RTMP2_CLIENT_STATE_DISCONNECTED &&
+        client->state != RTMP2_CLIENT_STATE_ERROR) {
+      GError *error = NULL;
+      gint attempts = 0;
       
-      if (error) {
-        /* Real error occurred */
-        GST_WARNING_OBJECT (src, "Client error: %s", error->message);
-        g_error_free (error);
-        error = NULL;
-        break;
-      }
-
-      if (!processed) {
-        /* No more data available or client disconnected */
-        if (client->state == RTMP2_CLIENT_STATE_DISCONNECTED ||
-            client->state == RTMP2_CLIENT_STATE_ERROR) {
-          GST_DEBUG_OBJECT (src, "Client disconnected or errored");
+      GST_DEBUG_OBJECT (src, "Processing handshake for client (state=%d, handshake_state=%d)",
+          client->state, client->handshake.state);
+      
+      /* Try to complete handshake (up to 50 reads for all handshake steps) */
+      while (attempts++ < 50 && !client->handshake_complete) {
+        if (!rtmp2_client_process_data (client, &error)) {
+          if (error) {
+            GST_WARNING_OBJECT (src, "Handshake error: %s", error->message);
+            g_error_free (error);
+            error = NULL;
+          }
+          break;
         }
-        break; /* Stop reading this client */
+        
+        if (client->handshake_complete) {
+          GST_INFO_OBJECT (src, "Handshake completed after %d attempts", attempts);
+        }
       }
     }
-
-    /* If client is publishing, make it active */
-    if (client->state == RTMP2_CLIENT_STATE_PUBLISHING &&
-        !src->active_client) {
+    
+    /* Check for new publishing clients */
+    if (client->state == RTMP2_CLIENT_STATE_PUBLISHING && !src->active_client) {
       src->active_client = client;
       GST_INFO_OBJECT (src, "Client started publishing");
     }
@@ -668,18 +659,18 @@ gst_rtmp2_server_src_create (GstPushSrc * psrc, GstBuffer ** buf)
     /* No data available - unlock, process events, sleep, then retry */
     g_mutex_unlock (&src->clients_lock);
     
-    /* Process any pending network events */
+    /* Process any pending network events (triggers async read callbacks) */
     while (g_main_context_pending (src->context)) {
       g_main_context_iteration (src->context, FALSE);
     }
     
     /* Adaptive sleep - minimal during active streaming to maximize frame capture */
     if (src->active_client && src->active_client->state == RTMP2_CLIENT_STATE_PUBLISHING) {
-      /* Client is actively publishing - tiny sleep to avoid spinning but maximize throughput */
-      g_usleep (100);  /* 100μs = 0.1ms, fast enough for 30fps (33ms per frame) */
+      /* Client is actively publishing - tiny sleep (async reads handle data capture) */
+      g_usleep (1000);  /* 1ms - async reading does the heavy lifting */
     } else if (retry_count < 100) {
-      /* Waiting for connection: minimal sleep */
-      g_usleep (1000);  /* 1ms */
+      /* Waiting for connection: short sleep */
+      g_usleep (5000);  /* 5ms */
     } else {
       /* Extended wait: longer sleep to reduce CPU */
       g_usleep (10000);  /* 10ms */
@@ -688,34 +679,13 @@ gst_rtmp2_server_src_create (GstPushSrc * psrc, GstBuffer ** buf)
     
     g_mutex_lock (&src->clients_lock);
     
-    /* Reprocess clients to get new data - drain socket buffers */
+    /* Check if client started publishing (async callback may have updated state) */
     for (l = src->clients; l; l = l->next) {
       Rtmp2Client *client = (Rtmp2Client *) l->data;
-      GError *error = NULL;
-      gint read_attempts = 0;
-      const gint max_reads = 100; /* Read up to 100 times per cycle - balanced throughput/responsiveness */
-      
-      if (client->state != RTMP2_CLIENT_STATE_DISCONNECTED &&
-          client->state != RTMP2_CLIENT_STATE_ERROR) {
-        /* Read multiple times to drain socket buffer */
-        for (read_attempts = 0; read_attempts < max_reads; read_attempts++) {
-          gboolean processed = rtmp2_client_process_data (client, &error);
-          if (error) {
-            g_error_free (error);
-            error = NULL;
-            break; /* Stop on error */
-          }
-          if (!processed) {
-            break; /* Stop if no more data */
-          }
-        }
-        
-        /* Check if this client started publishing and should become active */
-        if (client->state == RTMP2_CLIENT_STATE_PUBLISHING &&
-            !src->active_client) {
-          src->active_client = client;
-          GST_INFO_OBJECT (src, "Client started publishing (detected in retry loop)");
-        }
+      if (client->state == RTMP2_CLIENT_STATE_PUBLISHING && !src->active_client) {
+        src->active_client = client;
+        GST_INFO_OBJECT (src, "Client started publishing (detected in retry loop)");
+        break;
       }
     }
   }

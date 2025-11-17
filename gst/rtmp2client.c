@@ -377,6 +377,82 @@ rtmp2_client_new (GSocketConnection * connection, GIOStream * io_stream)
   return client;
 }
 
+/* Callback for continuous reading from client socket */
+static gboolean
+rtmp2_client_read_cb (GSocket * socket, GIOCondition condition, gpointer user_data)
+{
+  Rtmp2Client *client = (Rtmp2Client *) user_data;
+  GError *error = NULL;
+  gint read_attempts = 0;
+  const gint max_reads = 100;  /* Drain up to 100 chunks per callback */
+
+  /* Check if client is disconnected */
+  if (client->state == RTMP2_CLIENT_STATE_DISCONNECTED ||
+      client->state == RTMP2_CLIENT_STATE_ERROR) {
+    GST_DEBUG ("Client disconnected/error in read callback, removing source");
+    return G_SOURCE_REMOVE;
+  }
+
+  /* Check for error conditions */
+  if (condition & (G_IO_ERR | G_IO_HUP)) {
+    GST_WARNING ("Socket error or hangup detected");
+    client->state = RTMP2_CLIENT_STATE_DISCONNECTED;
+    return G_SOURCE_REMOVE;
+  }
+
+  /* Read multiple times to drain available data */
+  for (read_attempts = 0; read_attempts < max_reads; read_attempts++) {
+    gboolean processed = rtmp2_client_process_data (client, &error);
+    
+    if (error) {
+      GST_WARNING ("Error processing client data: %s", error->message);
+      g_error_free (error);
+      client->state = RTMP2_CLIENT_STATE_ERROR;
+      return G_SOURCE_REMOVE;
+    }
+    
+    if (!processed) {
+      /* No more data available right now */
+      break;
+    }
+  }
+
+  /* Keep the source alive */
+  return G_SOURCE_CONTINUE;
+}
+
+/* Setup continuous reading for a client */
+gboolean
+rtmp2_client_start_reading (Rtmp2Client * client, GMainContext * context)
+{
+  if (!client || !client->socket) {
+    GST_WARNING ("Cannot start reading: invalid client or socket");
+    return FALSE;
+  }
+
+  /* Don't create if already exists */
+  if (client->read_source) {
+    GST_DEBUG ("Read source already exists");
+    return TRUE;
+  }
+
+  /* Create GSource to monitor socket for incoming data */
+  client->read_source = g_socket_create_source (client->socket,
+      G_IO_IN | G_IO_ERR | G_IO_HUP, NULL);
+  
+  if (!client->read_source) {
+    GST_ERROR ("Failed to create socket source");
+    return FALSE;
+  }
+
+  g_source_set_callback (client->read_source,
+      (GSourceFunc) rtmp2_client_read_cb, client, NULL);
+  g_source_attach (client->read_source, context);
+
+  GST_DEBUG ("Started continuous reading for client (socket=%p)", client->socket);
+  return TRUE;
+}
+
 void
 rtmp2_client_free (Rtmp2Client * client)
 {
@@ -587,6 +663,16 @@ rtmp2_client_process_data (Rtmp2Client * client, GError ** error)
       GST_DEBUG ("C2 processed successfully, handshake complete!");
       client->handshake_complete = TRUE;
       client->state = RTMP2_CLIENT_STATE_CONNECTING;
+      
+      /* Start async reading now that handshake is complete */
+      if (client->user_data) {
+        GstRtmp2ServerSrc *src = GST_RTMP2_SERVER_SRC (client->user_data);
+        if (!rtmp2_client_start_reading (client, src->context)) {
+          GST_WARNING ("Failed to start async reading after handshake");
+        } else {
+          GST_INFO ("Started async reading after handshake completion");
+        }
+      }
     } else {
       GST_WARNING ("Unknown handshake state: %d", client->handshake.state);
     }
