@@ -400,8 +400,7 @@ rtmp2_client_read_cb (GSocket * socket, GIOCondition condition, gpointer user_da
     return G_SOURCE_REMOVE;
   }
 
-  /* Read multiple times to drain available data */
-  /* CRITICAL: Keep reading if chunk parser has buffered incomplete data */
+  /* Read multiple times to drain available data - fast and simple */
   for (read_attempts = 0; read_attempts < max_reads; read_attempts++) {
     gboolean processed = rtmp2_client_process_data (client, &error);
     
@@ -413,24 +412,7 @@ rtmp2_client_read_cb (GSocket * socket, GIOCondition condition, gpointer user_da
     }
     
     if (!processed) {
-      /* Check if chunk parser has buffered incomplete data waiting for more bytes */
-      gboolean has_buffered_data = (client->chunk_parser.read_buffer != NULL && 
-                                     client->chunk_parser.read_buffer->len > 0);
-      
-      if (has_buffered_data && read_attempts < max_reads - 1) {
-        /* Chunk parser is waiting for more data to complete a chunk */
-        /* Sleep longer to allow network packets to arrive - FFmpeg sends in bursts */
-        GST_INFO ("Chunk parser has %u bytes buffered, attempt %d/%d, waiting for more data...",
-            client->chunk_parser.read_buffer->len, read_attempts, max_reads);
-        g_usleep (10000);  /* 10ms - give network time to deliver more packets */
-        continue;  /* Try reading again */
-      }
-      
-      /* No more data and either no buffered data OR max attempts reached */
-      if (has_buffered_data) {
-        GST_WARNING ("Chunk parser still has %u bytes buffered after %d attempts - may be incomplete message",
-            client->chunk_parser.read_buffer->len, read_attempts);
-      }
+      /* No more data available right now - the 5ms timeout will retry */
       break;
     }
   }
