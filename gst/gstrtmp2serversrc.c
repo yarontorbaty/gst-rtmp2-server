@@ -176,13 +176,6 @@ gst_rtmp2_server_src_init (GstRtmp2ServerSrc * src)
   gst_base_src_set_live (GST_BASE_SRC (src), TRUE);
   gst_base_src_set_format (GST_BASE_SRC (src), GST_FORMAT_TIME);
   gst_base_src_set_do_timestamp (GST_BASE_SRC (src), TRUE);
-  
-  /* Set caps to video/x-flv for FLV tag output */
-  GstCaps *flv_caps = gst_caps_new_simple ("video/x-flv",
-      "streamheader", GST_TYPE_BUFFER, NULL,
-      NULL);
-  gst_base_src_set_caps (GST_BASE_SRC (src), flv_caps);
-  gst_caps_unref (flv_caps);
 }
 
 static void
@@ -467,6 +460,11 @@ gst_rtmp2_server_src_start (GstBaseSrc * bsrc)
       (GSourceFunc) server_accept_cb, src, NULL);
   g_source_attach (src->server_source, src->context);
 
+  /* Set caps early for proper negotiation */
+  GstCaps *caps = gst_caps_new_simple ("video/x-flv", NULL);
+  gst_base_src_set_caps (GST_BASE_SRC (src), caps);
+  gst_caps_unref (caps);
+
   GST_INFO_OBJECT (src, "RTMP server listening on %s:%u", src->host, src->port);
 
   return TRUE;
@@ -586,27 +584,6 @@ gst_rtmp2_server_src_create (GstPushSrc * psrc, GstBuffer ** buf)
         GST_INFO_OBJECT (src, "Returning FLV tag with %zu bytes (type=%d)", 
             buf_size, tag->tag_type);
         *buf = gst_buffer_ref (tag->data);
-
-        /* Set caps if not already set */
-        if (tag->tag_type == RTMP2_FLV_TAG_VIDEO && !src->have_video) {
-          caps = rtmp2_flv_tag_get_caps (tag);
-          if (caps) {
-            if (src->video_caps)
-              gst_caps_unref (src->video_caps);
-            src->video_caps = caps;
-            src->have_video = TRUE;
-            gst_pad_set_caps (GST_BASE_SRC (src)->srcpad, caps);
-          }
-        } else if (tag->tag_type == RTMP2_FLV_TAG_AUDIO && !src->have_audio) {
-          caps = rtmp2_flv_tag_get_caps (tag);
-          if (caps) {
-            if (src->audio_caps)
-              gst_caps_unref (src->audio_caps);
-            src->audio_caps = caps;
-            src->have_audio = TRUE;
-            gst_pad_set_caps (GST_BASE_SRC (src)->srcpad, caps);
-          }
-        }
 
         /* Set timestamp */
         GST_BUFFER_PTS (*buf) = tag->timestamp * GST_MSECOND;
