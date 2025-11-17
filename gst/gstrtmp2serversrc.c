@@ -563,6 +563,11 @@ gst_rtmp2_server_src_create (GstPushSrc * psrc, GstBuffer ** buf)
   if (src->active_client && src->active_client->state == RTMP2_CLIENT_STATE_PUBLISHING) {
     /* Check for FLV tags in the parser */
     flv_tags = src->active_client->flv_parser.pending_tags;
+    gint pending_count = g_list_length (flv_tags);
+    if (pending_count > 0) {
+      GST_DEBUG_OBJECT (src, "Found %d pending FLV tags", pending_count);
+    }
+    
     if (flv_tags) {
       tag = (Rtmp2FlvTag *) flv_tags->data;
       src->active_client->flv_parser.pending_tags =
@@ -570,6 +575,7 @@ gst_rtmp2_server_src_create (GstPushSrc * psrc, GstBuffer ** buf)
           flv_tags);
 
       if (tag->data) {
+        GST_INFO_OBJECT (src, "Returning FLV tag with %zu bytes", gst_buffer_get_size (tag->data));
         *buf = gst_buffer_ref (tag->data);
 
         /* Set caps if not already set */

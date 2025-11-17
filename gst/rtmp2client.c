@@ -646,9 +646,11 @@ rtmp2_client_process_data (Rtmp2Client * client, GError ** error)
         msg_idx, msg_count, msg->message_type, msg->message_length, msg->timestamp, msg->message_stream_id, msg->buffer);
 
     if (!msg->buffer) {
-      GST_WARNING ("Message has no buffer, skipping");
+      GST_WARNING ("Message type %d has no buffer, skipping", msg->message_type);
       continue;
     }
+
+    GST_INFO ("Message %d/%d: type=%d, length=%u", msg_idx, msg_count, msg->message_type, msg->message_length);
 
     switch (msg->message_type) {
       case RTMP2_MESSAGE_SET_CHUNK_SIZE:
@@ -867,26 +869,32 @@ rtmp2_client_process_data (Rtmp2Client * client, GError ** error)
 
       case RTMP2_MESSAGE_VIDEO:
       case RTMP2_MESSAGE_AUDIO:
-        GST_DEBUG ("Processing %s message (type=%d)",
+        GST_INFO ("Processing %s message (type=%d, length=%u, state=%d)",
             msg->message_type == RTMP2_MESSAGE_VIDEO ? "video" : "audio",
-            msg->message_type);
+            msg->message_type, msg->message_length, client->state);
         if (client->state == RTMP2_CLIENT_STATE_PUBLISHING) {
           GstMapInfo map;
           GList *new_tags = NULL;
           if (gst_buffer_map (msg->buffer, &map, GST_MAP_READ)) {
             GError *flv_error = NULL;
+            GST_INFO ("Calling FLV parser with %zu bytes", map.size);
             rtmp2_flv_parser_process (&client->flv_parser, map.data, map.size,
                 &new_tags, &flv_error);
             if (flv_error) {
-              GST_DEBUG ("FLV parser: %s (continuing)", flv_error->message);
+              GST_INFO ("FLV parser error: %s (continuing)", flv_error->message);
               g_clear_error (&flv_error);
             }
             if (new_tags) {
+              GST_INFO ("FLV parser created %d tags, adding to pending", g_list_length (new_tags));
               client->flv_parser.pending_tags =
                   g_list_concat (client->flv_parser.pending_tags, new_tags);
+            } else {
+              GST_INFO ("FLV parser created no tags");
             }
             gst_buffer_unmap (msg->buffer, &map);
           }
+        } else {
+          GST_WARNING ("Received media but state is not PUBLISHING (state=%d)", client->state);
         }
         break;
     }
