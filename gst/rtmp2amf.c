@@ -277,10 +277,22 @@ rtmp2_amf0_write_number (GByteArray * ba, gdouble num)
 {
   union {
     gdouble d;
-    guint8 b[8];
+    guint64 i;
   } u;
   u.d = num;
-  g_byte_array_append (ba, u.b, 8);
+  
+  /* AMF0 numbers are 8-byte IEEE 754 doubles in big-endian (network) byte order */
+  guint8 b[8];
+  b[0] = (u.i >> 56) & 0xff;
+  b[1] = (u.i >> 48) & 0xff;
+  b[2] = (u.i >> 40) & 0xff;
+  b[3] = (u.i >> 32) & 0xff;
+  b[4] = (u.i >> 24) & 0xff;
+  b[5] = (u.i >> 16) & 0xff;
+  b[6] = (u.i >> 8) & 0xff;
+  b[7] = u.i & 0xff;
+  
+  g_byte_array_append (ba, b, 8);
   return TRUE;
 }
 
@@ -342,6 +354,8 @@ rtmp2_amf_value_free (Rtmp2AmfValue * value)
       break;
   }
 
-  g_free (value);
+  /* Only free the value struct if it was heap-allocated (not used in this codebase) */
+  /* For stack-allocated values, caller should just let them go out of scope */
+  /* g_free (value); */
 }
 

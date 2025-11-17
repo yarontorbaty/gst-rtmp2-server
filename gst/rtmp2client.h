@@ -92,6 +92,7 @@ gboolean rtmp2_client_send_create_stream_result (Rtmp2Client *client, gdouble tr
 gboolean rtmp2_client_send_publish_result (Rtmp2Client *client, GError **error);
 gboolean rtmp2_client_send_release_stream_result (Rtmp2Client *client, gdouble transaction_id, GError **error);
 gboolean rtmp2_client_send_on_fc_publish (Rtmp2Client *client, const gchar *stream_name, GError **error);
+gboolean rtmp2_client_send_check_bw_result (Rtmp2Client *client, gdouble transaction_id, GError **error);
 gboolean rtmp2_client_parse_connect (Rtmp2Client *client, const guint8 *data, gsize size, GError **error);
 gboolean rtmp2_client_parse_publish (Rtmp2Client *client, const guint8 *data, gsize size, GError **error);
 

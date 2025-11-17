@@ -172,8 +172,10 @@ gst_rtmp2_server_src_init (GstRtmp2ServerSrc * src)
   src->video_caps = NULL;
   src->audio_caps = NULL;
 
-  /* Mark as async source - we wait for client connections */
-  gst_base_src_set_async (GST_BASE_SRC (src), TRUE);
+  /* Configure as live async source - we wait for client connections and stream in real-time */
+  gst_base_src_set_live (GST_BASE_SRC (src), TRUE);
+  gst_base_src_set_format (GST_BASE_SRC (src), GST_FORMAT_TIME);
+  gst_base_src_set_do_timestamp (GST_BASE_SRC (src), TRUE);
 }
 
 static void
@@ -308,39 +310,6 @@ gst_rtmp2_server_src_get_property (GObject * object, guint prop_id,
 }
 
 static gboolean
-client_read_cb (GPollableInputStream * stream, gpointer user_data)
-{
-  Rtmp2Client *client = (Rtmp2Client *) user_data;
-  GError *error = NULL;
-  GstRtmp2ServerSrc *src;
-
-  if (!client->user_data) {
-    GST_DEBUG ("Client has no user_data, removing source");
-    return G_SOURCE_REMOVE;
-  }
-
-  src = GST_RTMP2_SERVER_SRC (client->user_data);
-
-  GST_DEBUG_OBJECT (src, "Read callback triggered for client (state=%d)",
-      client->state);
-
-  if (!rtmp2_client_process_data (client, &error)) {
-    if (error) {
-      GST_WARNING_OBJECT (src, "Client processing error: %s", error->message);
-      g_error_free (error);
-    }
-    /* If client disconnected or errored, remove source */
-    if (client->state == RTMP2_CLIENT_STATE_DISCONNECTED ||
-        client->state == RTMP2_CLIENT_STATE_ERROR) {
-      GST_DEBUG_OBJECT (src, "Client disconnected/errored, removing read source");
-      return G_SOURCE_REMOVE;
-    }
-  }
-
-  return G_SOURCE_CONTINUE;
-}
-
-static gboolean
 server_accept_cb (GSocket * socket, GIOCondition condition, gpointer user_data)
 {
   GstRtmp2ServerSrc *src = GST_RTMP2_SERVER_SRC (user_data);
@@ -357,6 +326,9 @@ server_accept_cb (GSocket * socket, GIOCondition condition, gpointer user_data)
       g_error_free (error);
     return G_SOURCE_CONTINUE;
   }
+
+  /* Set client socket to non-blocking for async I/O */
+  g_socket_set_blocking (client_socket, FALSE);
 
   connection = g_socket_connection_factory_create_connection (client_socket);
   g_object_unref (client_socket);
@@ -413,24 +385,13 @@ server_accept_cb (GSocket * socket, GIOCondition condition, gpointer user_data)
   client->timeout_seconds = src->timeout;
   client->user_data = src;
 
-  /* Set up read source for immediate data processing */
-  if (client->input_stream && G_IS_POLLABLE_INPUT_STREAM (client->input_stream)) {
-    GSource *read_source = g_pollable_input_stream_create_source (
-        G_POLLABLE_INPUT_STREAM (client->input_stream), NULL);
-    if (read_source) {
-      /* Create a wrapper function that returns gboolean for GSource callback */
-      g_source_set_callback (read_source,
-          (GSourceFunc) client_read_cb, client, NULL);
-      g_source_attach (read_source, src->context);
-      client->read_source = read_source;
-    }
-  }
-
   g_mutex_lock (&src->clients_lock);
   src->clients = g_list_append (src->clients, client);
+  gint client_count = g_list_length (src->clients);
   g_mutex_unlock (&src->clients_lock);
 
-  GST_INFO_OBJECT (src, "New client connected%s", src->tls ? " (TLS)" : "");
+  GST_INFO_OBJECT (src, "New client connected%s (total clients: %d)",
+      src->tls ? " (TLS)" : "", client_count);
 
   return G_SOURCE_CONTINUE;
 }
@@ -545,37 +506,49 @@ gst_rtmp2_server_src_create (GstPushSrc * psrc, GstBuffer ** buf)
 {
   GstRtmp2ServerSrc *src = GST_RTMP2_SERVER_SRC (psrc);
   GstFlowReturn ret = GST_FLOW_OK;
-  GError *error = NULL;
   GList *l;
   GList *flv_tags = NULL;
   Rtmp2FlvTag *tag;
   GstCaps *caps;
-  gint retry_count = 0;
-  const gint max_retries = 100;  /* Wait up to 1 second (100 * 10ms) */
 
-  /* Process pending events in main context */
+  /* Process pending accept events */
   while (g_main_context_pending (src->context)) {
     g_main_context_iteration (src->context, FALSE);
   }
 
   g_mutex_lock (&src->clients_lock);
 
-  /* Process all clients */
+  gint client_count = g_list_length (src->clients);
+  GST_DEBUG_OBJECT (src, "Processing %d clients in create", client_count);
+
+  /* Process all clients with non-blocking reads */
   for (l = src->clients; l; l = l->next) {
     Rtmp2Client *client = (Rtmp2Client *) l->data;
+    GError *error = NULL;
+
+    GST_DEBUG_OBJECT (src, "Client state=%d, handshake_complete=%d",
+        client->state, client->handshake_complete);
 
     if (client->state == RTMP2_CLIENT_STATE_DISCONNECTED ||
         client->state == RTMP2_CLIENT_STATE_ERROR) {
+      GST_DEBUG_OBJECT (src, "Skipping disconnected/errored client");
       continue;
     }
 
-    if (!rtmp2_client_process_data (client, &error)) {
-      if (error) {
-        GST_WARNING_OBJECT (src, "Client error: %s", error->message);
-        g_error_free (error);
-        error = NULL;
-      }
-      continue;
+    /* Try to process client data once per create cycle */
+    GST_DEBUG_OBJECT (src, "Calling rtmp2_client_process_data");
+    gboolean processed = rtmp2_client_process_data (client, &error);
+    
+    if (error) {
+      /* Real error occurred */
+      GST_WARNING_OBJECT (src, "Client error: %s", error->message);
+      g_error_free (error);
+      error = NULL;
+    }
+
+    if (!processed && (client->state == RTMP2_CLIENT_STATE_DISCONNECTED ||
+                       client->state == RTMP2_CLIENT_STATE_ERROR)) {
+      GST_DEBUG_OBJECT (src, "Client disconnected or errored");
     }
 
     /* If client is publishing, make it active */

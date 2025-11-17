@@ -50,18 +50,6 @@ read_uint8 (const guint8 ** data, gsize * size)
   return val;
 }
 
-static guint16
-read_uint16_be (const guint8 ** data, gsize * size)
-{
-  guint16 val = 0;
-  if (*size < 2)
-    return 0;
-  val = ((*data)[0] << 8) | (*data)[1];
-  *data += 2;
-  *size -= 2;
-  return val;
-}
-
 static guint32
 read_uint24_be (const guint8 ** data, gsize * size)
 {
@@ -293,13 +281,20 @@ rtmp2_chunk_parser_process (Rtmp2ChunkParser * parser, const guint8 * data,
         return FALSE;
       }
 
-      if (chunk_type == RTMP2_CHUNK_TYPE_0) {
-        GST_DEBUG ("Type 0: allocating buffer for message length %u", msg->message_length);
-        msg->buffer = gst_buffer_new_allocate (NULL, msg->message_length, NULL);
-        msg->bytes_received = 0;
-      } else if (chunk_type == RTMP2_CHUNK_TYPE_1 || chunk_type == RTMP2_CHUNK_TYPE_2) {
+      if (chunk_type == RTMP2_CHUNK_TYPE_1 || chunk_type == RTMP2_CHUNK_TYPE_2) {
         GST_DEBUG ("Type %d: updating timestamp (delta=%u)", chunk_type, msg->timestamp_delta);
         msg->timestamp += msg->timestamp_delta;
+      }
+      /* Types 0/1/2 start a new message, so (re)allocate buffer */
+      if (chunk_type == RTMP2_CHUNK_TYPE_0 ||
+          chunk_type == RTMP2_CHUNK_TYPE_1 ||
+          chunk_type == RTMP2_CHUNK_TYPE_2) {
+        GST_DEBUG ("Allocating buffer for new message (length=%u)", msg->message_length);
+        if (msg->buffer)
+          gst_buffer_unref (msg->buffer);
+        msg->buffer = gst_buffer_new_allocate (NULL, msg->message_length, NULL);
+        msg->bytes_received = 0;
+        msg->complete = FALSE;
       }
     } else {
       GST_DEBUG ("Type 3: continuing previous message");
