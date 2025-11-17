@@ -401,6 +401,7 @@ rtmp2_client_read_cb (GSocket * socket, GIOCondition condition, gpointer user_da
   }
 
   /* Read multiple times to drain available data */
+  /* CRITICAL: Keep reading if chunk parser has buffered incomplete data */
   for (read_attempts = 0; read_attempts < max_reads; read_attempts++) {
     gboolean processed = rtmp2_client_process_data (client, &error);
     
@@ -412,7 +413,24 @@ rtmp2_client_read_cb (GSocket * socket, GIOCondition condition, gpointer user_da
     }
     
     if (!processed) {
-      /* No more data available right now */
+      /* Check if chunk parser has buffered incomplete data waiting for more bytes */
+      gboolean has_buffered_data = (client->chunk_parser.read_buffer != NULL && 
+                                     client->chunk_parser.read_buffer->len > 0);
+      
+      if (has_buffered_data && read_attempts < max_reads - 1) {
+        /* Chunk parser is waiting for more data to complete a chunk */
+        /* Sleep longer to allow network packets to arrive - FFmpeg sends in bursts */
+        GST_INFO ("Chunk parser has %u bytes buffered, attempt %d/%d, waiting for more data...",
+            client->chunk_parser.read_buffer->len, read_attempts, max_reads);
+        g_usleep (10000);  /* 10ms - give network time to deliver more packets */
+        continue;  /* Try reading again */
+      }
+      
+      /* No more data and either no buffered data OR max attempts reached */
+      if (has_buffered_data) {
+        GST_WARNING ("Chunk parser still has %u bytes buffered after %d attempts - may be incomplete message",
+            client->chunk_parser.read_buffer->len, read_attempts);
+      }
       break;
     }
   }
@@ -437,6 +455,7 @@ rtmp2_client_start_reading (Rtmp2Client * client, GMainContext * context)
   }
 
   /* Create GSource to monitor socket for incoming data */
+  /* Use G_IO_IN | G_IO_ERR | G_IO_HUP with periodic polling */
   client->read_source = g_socket_create_source (client->socket,
       G_IO_IN | G_IO_ERR | G_IO_HUP, NULL);
   
@@ -447,9 +466,22 @@ rtmp2_client_start_reading (Rtmp2Client * client, GMainContext * context)
 
   g_source_set_callback (client->read_source,
       (GSourceFunc) rtmp2_client_read_cb, client, NULL);
+  
+  /* Set priority to ensure it runs frequently */
+  g_source_set_priority (client->read_source, G_PRIORITY_HIGH);
+  
   g_source_attach (client->read_source, context);
 
-  GST_DEBUG ("Started continuous reading for client (socket=%p)", client->socket);
+  /* ALSO add a timeout source as backup to poll every 5ms */
+  /* This ensures we don't miss data if G_IO_IN doesn't retrigger */
+  client->timeout_source = g_timeout_source_new (5);  /* 5ms polling */
+  g_source_set_callback (client->timeout_source,
+      (GSourceFunc) rtmp2_client_read_cb, client, NULL);
+  g_source_set_priority (client->timeout_source, G_PRIORITY_DEFAULT);
+  g_source_attach (client->timeout_source, context);
+
+  GST_DEBUG ("Started continuous reading for client (socket=%p) with G_IO_IN + 5ms timeout", 
+      client->socket);
   return TRUE;
 }
 

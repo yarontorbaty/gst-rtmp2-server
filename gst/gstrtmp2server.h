@@ -64,6 +64,8 @@ struct _GstRtmp2ServerSrc {
   GSocket *server_socket;
   GSource *server_source;
   GMainContext *context;
+  GThread *event_thread;
+  gboolean running;
   GList *clients;
   GMutex clients_lock;
   GTlsCertificate *tls_cert;

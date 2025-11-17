@@ -162,6 +162,8 @@ gst_rtmp2_server_src_init (GstRtmp2ServerSrc * src)
   src->server_socket = NULL;
   src->server_source = NULL;
   src->context = NULL;
+  src->event_thread = NULL;
+  src->running = FALSE;
   src->clients = NULL;
   g_mutex_init (&src->clients_lock);
   src->tls_cert = NULL;
@@ -309,6 +311,25 @@ gst_rtmp2_server_src_get_property (GObject * object, guint prop_id,
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
   }
+}
+
+/* Event loop thread function - continuously pumps I/O events for async reading */
+/* This is how nginx-rtmp and gst-rtsp-server handle async I/O */
+static gpointer
+event_loop_thread_func (gpointer user_data)
+{
+  GstRtmp2ServerSrc *src = GST_RTMP2_SERVER_SRC (user_data);
+  
+  GST_INFO_OBJECT (src, "Event loop thread started");
+  
+  while (src->running) {
+    /* Blocking iteration - waits for I/O events and processes them */
+    /* This triggers async read callbacks when data arrives on client sockets */
+    g_main_context_iteration (src->context, TRUE);
+  }
+  
+  GST_INFO_OBJECT (src, "Event loop thread stopping");
+  return NULL;
 }
 
 static gboolean
@@ -474,12 +495,26 @@ gst_rtmp2_server_src_start (GstBaseSrc * bsrc)
       (GSourceFunc) server_accept_cb, src, NULL);
   g_source_attach (src->server_source, src->context);
 
+  /* Start dedicated event loop thread to pump I/O events */
+  /* This is similar to how nginx-rtmp and gst-rtsp-server handle async I/O */
+  src->running = TRUE;
+  src->event_thread = g_thread_new ("rtmp-event-loop", 
+      event_loop_thread_func, src);
+  
+  if (!src->event_thread) {
+    GST_ERROR_OBJECT (src, "Failed to create event loop thread");
+    g_object_unref (src->server_socket);
+    src->server_socket = NULL;
+    return FALSE;
+  }
+
   /* Set caps early for proper negotiation */
   GstCaps *caps = gst_caps_new_empty_simple ("video/x-flv");
   gst_base_src_set_caps (GST_BASE_SRC (src), caps);
   gst_caps_unref (caps);
 
-  GST_INFO_OBJECT (src, "RTMP server listening on %s:%u", src->host, src->port);
+  GST_INFO_OBJECT (src, "RTMP server listening on %s:%u (event loop running)", 
+      src->host, src->port);
 
   return TRUE;
 }
@@ -489,6 +524,22 @@ gst_rtmp2_server_src_stop (GstBaseSrc * bsrc)
 {
   GstRtmp2ServerSrc *src = GST_RTMP2_SERVER_SRC (bsrc);
   GList *l;
+
+  /* Stop event loop thread first */
+  if (src->event_thread) {
+    GST_INFO_OBJECT (src, "Stopping event loop thread");
+    src->running = FALSE;
+    
+    /* Wake up the event loop if it's blocked */
+    if (src->context) {
+      g_main_context_wakeup (src->context);
+    }
+    
+    /* Wait for thread to finish */
+    g_thread_join (src->event_thread);
+    src->event_thread = NULL;
+    GST_INFO_OBJECT (src, "Event loop thread stopped");
+  }
 
   if (src->server_source) {
     g_source_destroy (src->server_source);
@@ -668,24 +719,20 @@ gst_rtmp2_server_src_create (GstPushSrc * psrc, GstBuffer ** buf)
       }
     }
     
-    /* No data available - unlock, process events, sleep, then retry */
+    /* No data available - unlock, sleep, then retry */
+    /* Event loop thread handles all I/O pumping, so we just wait */
     g_mutex_unlock (&src->clients_lock);
     
-    /* Process any pending network events (triggers async read callbacks) */
-    while (g_main_context_pending (src->context)) {
-      g_main_context_iteration (src->context, FALSE);
-    }
-    
-    /* Adaptive sleep - minimal during active streaming to maximize frame capture */
+    /* Adaptive sleep - event thread does the I/O work */
     if (src->active_client && src->active_client->state == RTMP2_CLIENT_STATE_PUBLISHING) {
-      /* Client is actively publishing - tiny sleep (async reads handle data capture) */
-      g_usleep (1000);  /* 1ms - async reading does the heavy lifting */
-    } else if (retry_count < 100) {
-      /* Waiting for connection: short sleep */
+      /* Client is actively publishing - short sleep */
       g_usleep (5000);  /* 5ms */
+    } else if (retry_count < 100) {
+      /* Waiting for connection: moderate sleep */
+      g_usleep (10000);  /* 10ms */
     } else {
       /* Extended wait: longer sleep to reduce CPU */
-      g_usleep (10000);  /* 10ms */
+      g_usleep (50000);  /* 50ms */
     }
     retry_count++;
     
