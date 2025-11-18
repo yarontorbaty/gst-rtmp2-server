@@ -25,6 +25,7 @@
 #include "gstrtmp2server.h"
 #include "gstrtmp2serversrc.h"
 #include "rtmp2chunk.h"
+#include "rtmp2chunk_v2.h"
 
 #include <string.h>
 #include <sys/socket.h>
@@ -143,8 +144,9 @@ gst_rtmp2_server_src_class_init (GstRtmp2ServerSrcClass * klass)
   /* Initialize client debug category */
   rtmp2_client_debug_init ();
   
-  /* Initialize chunk parser debug category */
+  /* Initialize chunk parser debug categories */
   rtmp2_chunk_debug_init ();
+  rtmp2_chunk_v2_debug_init ();
 }
 
 static void
@@ -628,12 +630,15 @@ gst_rtmp2_server_src_create (GstPushSrc * psrc, GstBuffer ** buf)
           retry_count, src->active_client, g_list_length(src->clients));
     }
     
-    if (src->active_client && src->active_client->state == RTMP2_CLIENT_STATE_PUBLISHING) {
+    if (src->active_client && 
+        (src->active_client->state == RTMP2_CLIENT_STATE_PUBLISHING ||
+         src->active_client->state == RTMP2_CLIENT_STATE_DISCONNECTED)) {
       /* Check for FLV tags in the parser */
+      /* Allow reading even after disconnection to drain remaining buffered tags */
       flv_tags = src->active_client->flv_parser.pending_tags;
       gint pending_count = g_list_length (flv_tags);
       if (pending_count > 0) {
-        GST_INFO_OBJECT (src, "Found %d pending FLV tags", pending_count);
+        GST_INFO_OBJECT (src, "📦 FOUND %d pending FLV tags in queue", pending_count);
       } else if (retry_count % 100 == 0) {
         GST_DEBUG_OBJECT (src, "Waiting for FLV tags... (retry %d, active_client=%p, state=%d)", 
             retry_count, src->active_client, src->active_client ? src->active_client->state : -1);
@@ -647,8 +652,12 @@ gst_rtmp2_server_src_create (GstPushSrc * psrc, GstBuffer ** buf)
 
         if (tag->data && gst_buffer_get_size (tag->data) > 0) {
           gsize buf_size = gst_buffer_get_size (tag->data);
-          GST_INFO_OBJECT (src, "Returning FLV tag with %zu bytes (type=%d)", 
-              buf_size, tag->tag_type);
+          static gint frame_num = 0;
+          frame_num++;
+          GST_INFO_OBJECT (src, "📤 RETURNING FLV TAG #%d: %zu bytes type=%s ts=%u", 
+              frame_num, buf_size, 
+              tag->tag_type == RTMP2_FLV_TAG_VIDEO ? "video" : "audio",
+              tag->timestamp);
           *buf = gst_buffer_ref (tag->data);
 
           /* Set timestamp */
@@ -664,6 +673,16 @@ gst_rtmp2_server_src_create (GstPushSrc * psrc, GstBuffer ** buf)
           /* Empty tag - skip it and continue waiting */
           rtmp2_flv_tag_free (tag);
           g_list_free (flv_tags);
+        }
+      }
+      
+      /* Check if client disconnected with no more pending data - signal EOS */
+      if (src->active_client->state == RTMP2_CLIENT_STATE_DISCONNECTED) {
+        gint remaining = g_list_length (src->active_client->flv_parser.pending_tags);
+        if (remaining == 0) {
+          GST_INFO_OBJECT (src, "Client disconnected and all tags drained - returning EOS");
+          g_mutex_unlock (&src->clients_lock);
+          return GST_FLOW_EOS;
         }
       }
     }

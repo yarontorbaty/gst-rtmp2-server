@@ -25,6 +25,7 @@
 #include <gio/gio.h>
 #include "rtmp2handshake.h"
 #include "rtmp2chunk.h"
+#include "rtmp2chunk_v2.h"
 #include "rtmp2flv.h"
 #include "rtmp2amf.h"
 #include "rtmp2enhanced.h"
@@ -54,7 +55,7 @@ typedef struct _Rtmp2Client {
   
   Rtmp2ClientState state;
   Rtmp2Handshake handshake;
-  Rtmp2ChunkParser chunk_parser;
+  Rtmp2ChunkParserV2 chunk_parser;
   Rtmp2FlvParser flv_parser;
   
       gchar *application;

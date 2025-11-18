@@ -25,6 +25,7 @@
 #include "rtmp2client.h"
 #include "gstrtmp2server.h"
 #include "rtmp2amf.h"
+#include "rtmp2chunk_v2.h"
 #include <string.h>
 #include <glib/gprintf.h>
 
@@ -361,7 +362,8 @@ rtmp2_client_new (GSocketConnection * connection, GIOStream * io_stream)
 
   client->state = RTMP2_CLIENT_STATE_HANDSHAKE;
   rtmp2_handshake_init (&client->handshake);
-  rtmp2_chunk_parser_init (&client->chunk_parser);
+  /* chunk_parser will be initialized after handshake when buffered_input is ready */
+  memset (&client->chunk_parser, 0, sizeof (client->chunk_parser));
   rtmp2_flv_parser_init (&client->flv_parser);
 
   client->handshake_complete = FALSE;
@@ -412,13 +414,21 @@ client_read_thread_func (gpointer user_data)
     /* This handles incomplete chunks by reading more data */
     while (read_attempts++ < max_attempts && !processed) {
       
-      /* Wait for data with timeout */
+      /* Wait for data with 50ms timeout using g_socket_condition_timed_wait */
       if (client->socket) {
         GError *wait_error = NULL;
-        gboolean ready = g_socket_condition_wait (client->socket, G_IO_IN, 
-            NULL, &wait_error);
+        gint64 timeout_us = 50000;  /* 50ms in microseconds */
+        gboolean ready = g_socket_condition_timed_wait (client->socket, G_IO_IN,
+            timeout_us, NULL, &wait_error);
         
         if (wait_error) {
+          /* Timeout is normal - just means no data yet */
+          if (g_error_matches (wait_error, G_IO_ERROR, G_IO_ERROR_TIMED_OUT)) {
+            GST_DEBUG ("Socket wait timeout (normal - no data yet)");
+            g_error_free (wait_error);
+            break;  /* Exit inner loop, retry outer */
+          }
+          /* Real error - exit thread */
           GST_WARNING ("Socket wait error: %s", wait_error->message);
           g_error_free (wait_error);
           goto thread_exit;
@@ -442,6 +452,16 @@ client_read_thread_func (gpointer user_data)
       }
       
       if (error) {
+        /* Check if it's EOF (connection closed) vs real error */
+        if (g_error_matches (error, GST_CORE_ERROR, GST_CORE_ERROR_FAILED) &&
+            error->message && strstr (error->message, "Connection closed")) {
+          GST_INFO ("Connection closed gracefully, read thread finishing");
+          client->state = RTMP2_CLIENT_STATE_DISCONNECTED;
+          g_error_free (error);
+          error = NULL;
+          goto thread_exit;
+        }
+        /* Real error */
         GST_WARNING ("Error in read thread: %s", error->message);
         g_error_free (error);
         error = NULL;
@@ -475,9 +495,7 @@ rtmp2_client_read_cb (GSocket * socket, GIOCondition condition, gpointer user_da
   Rtmp2Client *client = (Rtmp2Client *) user_data;
   GError *error = NULL;
   gint read_attempts = 0;
-  const gint max_reads = 100;  /* Drain up to 100 chunks per callback */
-  static gint64 last_chunk_clear = 0;
-  gint64 now = g_get_monotonic_time();
+  const gint max_reads = 100;  /* Drain up to 100 messages per callback */
 
   /* Check if client is disconnected */
   if (client->state == RTMP2_CLIENT_STATE_DISCONNECTED ||
@@ -491,18 +509,6 @@ rtmp2_client_read_cb (GSocket * socket, GIOCondition condition, gpointer user_da
     GST_WARNING ("Socket error or hangup detected");
     client->state = RTMP2_CLIENT_STATE_DISCONNECTED;
     return G_SOURCE_REMOVE;
-  }
-
-  /* CRITICAL FIX: Clear stale incomplete chunks every 100ms */
-  /* This prevents old control message fragments from blocking new video data */
-  if (client->state == RTMP2_CLIENT_STATE_PUBLISHING && 
-      (now - last_chunk_clear) > 100000) {  /* 100ms */
-    guint incomplete = g_hash_table_size(client->chunk_parser.chunk_streams);
-    if (incomplete > 0) {
-      GST_INFO ("Clearing %u stale incomplete chunks to unblock video processing", incomplete);
-      g_hash_table_remove_all(client->chunk_parser.chunk_streams);
-    }
-    last_chunk_clear = now;
   }
 
   /* Read multiple times to drain available data - fast and simple */
@@ -595,7 +601,7 @@ rtmp2_client_free (Rtmp2Client * client)
     g_source_unref (client->timeout_source);
   }
 
-  rtmp2_chunk_parser_clear (&client->chunk_parser);
+  rtmp2_chunk_parser_v2_clear (&client->chunk_parser);
   rtmp2_flv_parser_clear (&client->flv_parser);
 
   g_free (client->application);
@@ -664,11 +670,9 @@ rtmp2_client_send_handshake (Rtmp2Client * client, GError ** error)
 gboolean
 rtmp2_client_process_data (Rtmp2Client * client, GError ** error)
 {
-  guint8 buffer[16384];  /* Increased from 4KB to 16KB for better throughput */
+  guint8 buffer[16384];  /* Used for handshake only */
   gssize bytes_read;
-  GList *messages = NULL;
-  GList *l;
-  Rtmp2ChunkMessage *msg;
+  Rtmp2ChunkMessage *msg = NULL;
 
   GST_DEBUG ("Processing data for client, state=%d, handshake_complete=%d, handshake_state=%d",
       client->state, client->handshake_complete, client->handshake.state);
@@ -794,17 +798,27 @@ rtmp2_client_process_data (Rtmp2Client * client, GError ** error)
       
       /* Create buffered input stream NOW (after handshake) for chunk reads */
       /* This is like gortmplib's bufio.Reader - handles TCP fragmentation */
-      /* Keep socket NON-BLOCKING to prevent blocking on writes */
       if (!client->buffered_input) {
+        /* CRITICAL: Set socket to BLOCKING mode for V2 parser */
+        /* V2 parser uses ensure() which needs blocking reads to wait for complete messages */
+        if (client->socket) {
+          g_socket_set_blocking (client->socket, TRUE);
+          GST_INFO ("Set socket to BLOCKING mode for V2 parser");
+        }
+        
         client->buffered_input = g_buffered_input_stream_new (client->input_stream);
         g_buffered_input_stream_set_buffer_size (
             G_BUFFERED_INPUT_STREAM (client->buffered_input), 65536);
         GST_INFO ("Created 64KB buffered input stream for TCP fragmentation handling");
+        
+        /* Initialize V2 chunk parser with buffered input stream */
+        rtmp2_chunk_parser_v2_init (&client->chunk_parser, client->buffered_input);
+        GST_INFO ("Initialized chunk parser V2 with buffered stream");
       }
       
       /* Start dedicated read thread */
-      /* Socket stays NON-BLOCKING so writes don't block */
-      /* Thread will poll with g_socket_condition_wait for data */
+      /* Socket is now BLOCKING for V2 parser - reads will wait for complete data */
+      /* Thread uses synchronous blocking reads via ensure() */
       client->thread_running = TRUE;
       client->read_thread = g_thread_new ("rtmp-client-reader", 
           client_read_thread_func, client);
@@ -822,75 +836,46 @@ rtmp2_client_process_data (Rtmp2Client * client, GError ** error)
     return TRUE;
   }
 
-  /* Read RTMP chunks */
-  GST_DEBUG ("Reading RTMP chunks (handshake complete)");
+  /* Read RTMP chunks with V2 parser */
+  GST_DEBUG ("Reading RTMP message with V2 parser (handshake complete)");
   
-  /* Use buffered_input if available (after handshake), otherwise direct input */
-  /* buffered_input is created when read thread starts - handles TCP fragmentation */
-  if (client->buffered_input) {
-    /* Buffered input - synchronous read for read thread (like bufio.Reader) */
-    bytes_read = g_input_stream_read (client->buffered_input, buffer,
-        sizeof (buffer), NULL, error);
-    GST_DEBUG ("Read %zd bytes from buffered stream", bytes_read);
-  } else {
-    /* Direct input - non-blocking for handshake phase */
-    if (G_IS_POLLABLE_INPUT_STREAM (client->input_stream)) {
-      bytes_read = g_pollable_input_stream_read_nonblocking (
-          G_POLLABLE_INPUT_STREAM (client->input_stream),
-          buffer, sizeof (buffer), NULL, error);
-    } else {
-      bytes_read = g_input_stream_read (client->input_stream, buffer,
-          sizeof (buffer), NULL, error);
+  /* V2 parser handles all buffering internally - just read one message */
+  /* The ensure() function will block until complete message is ready */
+  if (!rtmp2_chunk_parser_v2_read_message (&client->chunk_parser, &msg, error)) {
+    /* Check if it's a read error or EOF */
+    if (error && *error) {
+      if (g_error_matches (*error, G_IO_ERROR, G_IO_ERROR_WOULD_BLOCK)) {
+        GST_DEBUG ("No data available (WOULD_BLOCK)");
+        g_clear_error (error);
+        return FALSE;
+      }
+      GST_WARNING ("Failed to read message: %s", (*error)->message);
+      client->state = RTMP2_CLIENT_STATE_ERROR;
+      return FALSE;
     }
-    GST_DEBUG ("Read %zd bytes from direct stream", bytes_read);
-  }
-  if (bytes_read < 0) {
-    /* Check if it's WOULD_BLOCK (no data available yet) */
-    if (error && *error && g_error_matches (*error, G_IO_ERROR, G_IO_ERROR_WOULD_BLOCK)) {
-      GST_DEBUG ("No data available (WOULD_BLOCK), returning FALSE to avoid spinning");
-      g_clear_error (error);
-      return FALSE;  /* No data - let caller's adaptive sleep handle retry timing */
-    }
-    GST_WARNING ("Failed to read chunk data: %s",
-        error && *error ? (*error)->message : "Unknown");
-    return FALSE;
-  }
-  if (bytes_read == 0) {
-    GST_DEBUG ("EOF while reading chunks (connection closed)");
+    /* EOF */
+    GST_DEBUG ("EOF while reading message (connection closed)");
     client->state = RTMP2_CLIENT_STATE_DISCONNECTED;
     return FALSE;
   }
 
   client->last_activity = g_get_monotonic_time ();
 
-  GST_DEBUG ("Processing %zd bytes through chunk parser", bytes_read);
-  if (!rtmp2_chunk_parser_process (&client->chunk_parser, buffer, bytes_read,
-          &messages, error)) {
-    GST_WARNING ("Failed to process chunks: %s",
-        error && *error ? (*error)->message : "Unknown");
-    return FALSE;
-  }
-  gint msg_count = g_list_length (messages);
-  GST_DEBUG ("Chunk parser returned %d messages", msg_count);
-  if (msg_count > 0) {
-    GST_INFO ("Processing %d RTMP messages from this read", msg_count);
-  }
+  /* Process the single message */
+  if (msg) {
+    GST_INFO ("V2 parser returned complete message: type=%d, length=%u",
+        msg->message_type, msg->message_length);
 
-  /* Process messages */
-  gint msg_idx = 0;
-  for (l = messages; l; l = l->next) {
-    msg = (Rtmp2ChunkMessage *) l->data;
-    msg_idx++;
-
-    GST_DEBUG ("Processing message %d/%d: type=%d, length=%u, timestamp=%u, stream_id=%u, buffer=%p",
-        msg_idx, msg_count, msg->message_type, msg->message_length, msg->timestamp, msg->message_stream_id, msg->buffer);
+    GST_DEBUG ("Processing message: type=%d, length=%u, timestamp=%u, stream_id=%u, buffer=%p",
+        msg->message_type, msg->message_length, msg->timestamp, msg->message_stream_id, msg->buffer);
 
     if (!msg->buffer) {
       GST_WARNING ("Message type %d has no buffer, skipping", msg->message_type);
-      continue;
+      rtmp2_chunk_message_free (msg);
+      return TRUE;
     }
 
-    GST_INFO ("Message %d/%d: type=%d, length=%u", msg_idx, msg_count, msg->message_type, msg->message_length);
+    GST_INFO ("Processing message: type=%d, length=%u", msg->message_type, msg->message_length);
 
     switch (msg->message_type) {
       case RTMP2_MESSAGE_SET_CHUNK_SIZE:
@@ -1109,9 +1094,9 @@ rtmp2_client_process_data (Rtmp2Client * client, GError ** error)
 
       case RTMP2_MESSAGE_VIDEO:
       case RTMP2_MESSAGE_AUDIO:
-        GST_DEBUG ("Processing %s message (type=%d, length=%u, state=%d)",
-            msg->message_type == RTMP2_MESSAGE_VIDEO ? "video" : "audio",
-            msg->message_type, msg->message_length, client->state);
+        GST_INFO ("📹 %s FRAME: type=%d length=%u timestamp=%u state=%d",
+            msg->message_type == RTMP2_MESSAGE_VIDEO ? "VIDEO" : "AUDIO",
+            msg->message_type, msg->message_length, msg->timestamp, client->state);
         if (client->state == RTMP2_CLIENT_STATE_PUBLISHING) {
           /* Create FLV tag from RTMP message data */
           /* RTMP video/audio messages contain FLV tag body (without 11-byte header) */
@@ -1170,27 +1155,25 @@ rtmp2_client_process_data (Rtmp2Client * client, GError ** error)
             client->flv_parser.pending_tags = 
                 g_list_append (client->flv_parser.pending_tags, tag);
             
-            GST_DEBUG ("Created FLV tag: type=%s, size=%u, timestamp=%u",
+            gint pending_count = g_list_length (client->flv_parser.pending_tags);
+            GST_INFO ("✅ CREATED FLV TAG #%d: type=%s size=%u ts=%u (queue=%d tags)",
+                pending_count, 
                 tag->tag_type == RTMP2_FLV_TAG_VIDEO ? "video" : "audio",
-                tag->data_size, tag->timestamp);
+                tag->data_size, tag->timestamp, pending_count);
           } else {
             gst_buffer_unref (flv_tag_buffer);
+            GST_WARNING ("❌ DROPPED FRAME: Failed to map buffers");
           }
         } else {
-          GST_WARNING ("Received media but state is not PUBLISHING (state=%d)", client->state);
+          GST_WARNING ("❌ DROPPED FRAME: Received %s but state is not PUBLISHING (state=%d)", 
+              msg->message_type == RTMP2_MESSAGE_VIDEO ? "VIDEO" : "AUDIO",
+              client->state);
         }
         break;
     }
-  }
-
-  if (messages) {
-    GList *l;
-    /* Free all messages - they were already removed from hash table via steal() */
-    for (l = messages; l; l = l->next) {
-      Rtmp2ChunkMessage *msg = (Rtmp2ChunkMessage *) l->data;
-      rtmp2_chunk_message_free (msg);
-    }
-    g_list_free (messages);
+    
+    /* Free the message after processing */
+    rtmp2_chunk_message_free (msg);
   }
 
   return TRUE;
