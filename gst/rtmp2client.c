@@ -398,61 +398,71 @@ client_read_thread_func (gpointer user_data)
   
   GST_INFO ("Client read thread started (MediaMTX pattern: sync buffered reads)");
   
-  /* Continuous read loop - like gortmplib's for loop */
-  /* With non-blocking socket, wait for data availability then read */
+  /* Continuous read loop - like SRS's recv_message loop */
+  /* KEY: Keep reading until chunks complete, like in_buffer->grow() */
   while (client->thread_running &&
          client->state != RTMP2_CLIENT_STATE_DISCONNECTED &&
          client->state != RTMP2_CLIENT_STATE_ERROR) {
     
-    /* Wait for data available on socket (with 100ms timeout) */
-    /* This prevents spinning while allowing responsiveness */
-    if (client->socket) {
-      GError *wait_error = NULL;
-      gboolean ready = g_socket_condition_wait (client->socket, G_IO_IN, 
-          NULL, &wait_error);
+    gboolean processed = FALSE;
+    gint read_attempts = 0;
+    const gint max_attempts = 100;  /* Try up to 100 times to complete chunks */
+    
+    /* Keep reading until we process complete messages (like SRS) */
+    /* This handles incomplete chunks by reading more data */
+    while (read_attempts++ < max_attempts && !processed) {
       
-      if (wait_error) {
-        GST_WARNING ("Socket wait error: %s", wait_error->message);
-        g_error_free (wait_error);
-        break;
+      /* Wait for data with timeout */
+      if (client->socket) {
+        GError *wait_error = NULL;
+        gboolean ready = g_socket_condition_wait (client->socket, G_IO_IN, 
+            NULL, &wait_error);
+        
+        if (wait_error) {
+          GST_WARNING ("Socket wait error: %s", wait_error->message);
+          g_error_free (wait_error);
+          goto thread_exit;
+        }
+        
+        if (!ready) {
+          break;  /* Timeout - exit inner loop, retry outer */
+        }
       }
       
-      if (!ready) {
-        continue;  /* Timeout, try again */
+      /* Lock and process */
+      if (src) {
+        g_mutex_lock (&src->clients_lock);
+      }
+      
+      /* Process data - buffered input + chunk parser */
+      processed = rtmp2_client_process_data (client, &error);
+      
+      if (src) {
+        g_mutex_unlock (&src->clients_lock);
+      }
+      
+      if (error) {
+        GST_WARNING ("Error in read thread: %s", error->message);
+        g_error_free (error);
+        error = NULL;
+        client->state = RTMP2_CLIENT_STATE_ERROR;
+        goto thread_exit;
+      }
+      
+      if (!processed) {
+        /* No data or incomplete chunk - wait briefly then try reading more */
+        /* This is like SRS's in_buffer->grow() - keeps reading until enough data */
+        g_usleep (100);  /* 100μs - brief wait for more TCP packets */
       }
     }
     
-    /* Data available - process it */
-    gboolean processed;
-    
-    if (src) {
-      g_mutex_lock (&src->clients_lock);
-    }
-    
-    /* Buffered input handles TCP fragmentation */
-    processed = rtmp2_client_process_data (client, &error);
-    
-    if (src) {
-      g_mutex_unlock (&src->clients_lock);
-    }
-    
-    if (error) {
-      GST_WARNING ("Error in read thread: %s", error->message);
-      g_error_free (error);
-      error = NULL;
-      client->state = RTMP2_CLIENT_STATE_ERROR;
-      break;
-    }
-    
+    /* If hit max attempts without processing, wait longer */
     if (!processed) {
-      /* No complete data yet - wait for more */
-      if (client->state == RTMP2_CLIENT_STATE_DISCONNECTED) {
-        GST_INFO ("Client disconnected in read thread");
-        break;
-      }
-      g_usleep (1000);  /* 1ms before retry */
+      g_usleep (5000);  /* 5ms before retry */
     }
   }
+
+thread_exit:
   
   GST_INFO ("Client read thread exiting");
   return NULL;

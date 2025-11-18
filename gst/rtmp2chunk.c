@@ -309,8 +309,19 @@ rtmp2_chunk_parser_process (Rtmp2ChunkParser * parser, const guint8 * data,
       chunk_data_size = MIN (parser->config.chunk_size - (msg->bytes_received % parser->config.chunk_size),
           msg->message_length - msg->bytes_received);
     }
-    bytes_to_read = MIN (chunk_data_size, remaining);
-    GST_DEBUG ("Reading chunk data: chunk_size=%u, bytes_received=%zu, message_length=%u, "
+    
+    /* CRITICAL FIX (from nginx-rtmp): Don't process partial chunks! */
+    /* Wait until we have enough data for this chunk */
+    if (remaining < chunk_data_size) {
+      GST_DEBUG ("Not enough data for chunk: have %zu, need %zu - waiting for more",
+          remaining, chunk_data_size);
+      /* Don't process incomplete chunk - leave message in hash table */
+      /* Next call with more data will complete it */
+      break;  /* Exit parser, preserving incomplete message */
+    }
+    
+    bytes_to_read = chunk_data_size;  /* Read complete chunk only */
+    GST_DEBUG ("Reading complete chunk: chunk_size=%u, bytes_received=%zu, message_length=%u, "
         "chunk_data_size=%zu, bytes_to_read=%zu, remaining=%zu",
         parser->config.chunk_size, msg->bytes_received, msg->message_length,
         chunk_data_size, bytes_to_read, remaining);
