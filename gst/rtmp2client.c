@@ -412,13 +412,21 @@ client_read_thread_func (gpointer user_data)
     /* This handles incomplete chunks by reading more data */
     while (read_attempts++ < max_attempts && !processed) {
       
-      /* Wait for data with timeout */
+      /* Wait for data with 50ms timeout using g_socket_condition_timed_wait */
       if (client->socket) {
         GError *wait_error = NULL;
-        gboolean ready = g_socket_condition_wait (client->socket, G_IO_IN, 
-            NULL, &wait_error);
+        gint64 timeout_us = 50000;  /* 50ms in microseconds */
+        gboolean ready = g_socket_condition_timed_wait (client->socket, G_IO_IN,
+            timeout_us, NULL, &wait_error);
         
         if (wait_error) {
+          /* Timeout is normal - just means no data yet */
+          if (g_error_matches (wait_error, G_IO_ERROR, G_IO_ERROR_TIMED_OUT)) {
+            GST_DEBUG ("Socket wait timeout (normal - no data yet)");
+            g_error_free (wait_error);
+            break;  /* Exit inner loop, retry outer */
+          }
+          /* Real error - exit thread */
           GST_WARNING ("Socket wait error: %s", wait_error->message);
           g_error_free (wait_error);
           goto thread_exit;
