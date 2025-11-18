@@ -1117,9 +1117,9 @@ rtmp2_client_process_data (Rtmp2Client * client, GError ** error)
 
       case RTMP2_MESSAGE_VIDEO:
       case RTMP2_MESSAGE_AUDIO:
-        GST_DEBUG ("Processing %s message (type=%d, length=%u, state=%d)",
-            msg->message_type == RTMP2_MESSAGE_VIDEO ? "video" : "audio",
-            msg->message_type, msg->message_length, client->state);
+        GST_INFO ("📹 %s FRAME: type=%d length=%u timestamp=%u state=%d",
+            msg->message_type == RTMP2_MESSAGE_VIDEO ? "VIDEO" : "AUDIO",
+            msg->message_type, msg->message_length, msg->timestamp, client->state);
         if (client->state == RTMP2_CLIENT_STATE_PUBLISHING) {
           /* Create FLV tag from RTMP message data */
           /* RTMP video/audio messages contain FLV tag body (without 11-byte header) */
@@ -1178,14 +1178,19 @@ rtmp2_client_process_data (Rtmp2Client * client, GError ** error)
             client->flv_parser.pending_tags = 
                 g_list_append (client->flv_parser.pending_tags, tag);
             
-            GST_DEBUG ("Created FLV tag: type=%s, size=%u, timestamp=%u",
+            gint pending_count = g_list_length (client->flv_parser.pending_tags);
+            GST_INFO ("✅ CREATED FLV TAG #%d: type=%s size=%u ts=%u (queue=%d tags)",
+                pending_count, 
                 tag->tag_type == RTMP2_FLV_TAG_VIDEO ? "video" : "audio",
-                tag->data_size, tag->timestamp);
+                tag->data_size, tag->timestamp, pending_count);
           } else {
             gst_buffer_unref (flv_tag_buffer);
+            GST_WARNING ("❌ DROPPED FRAME: Failed to map buffers");
           }
         } else {
-          GST_WARNING ("Received media but state is not PUBLISHING (state=%d)", client->state);
+          GST_WARNING ("❌ DROPPED FRAME: Received %s but state is not PUBLISHING (state=%d)", 
+              msg->message_type == RTMP2_MESSAGE_VIDEO ? "VIDEO" : "AUDIO",
+              client->state);
         }
         break;
     }
