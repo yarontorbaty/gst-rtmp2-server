@@ -399,19 +399,37 @@ client_read_thread_func (gpointer user_data)
   GST_INFO ("Client read thread started (MediaMTX pattern: sync buffered reads)");
   
   /* Continuous read loop - like gortmplib's for loop */
-  /* Key: synchronous reads with GBufferedInputStream handle TCP fragmentation */
+  /* With non-blocking socket, wait for data availability then read */
   while (client->thread_running &&
          client->state != RTMP2_CLIENT_STATE_DISCONNECTED &&
          client->state != RTMP2_CLIENT_STATE_ERROR) {
     
-    /* Call rtmp2_client_process_data which reads from buffered_input */
-    /* With buffered input, chunks split across TCP packets are reassembled */
+    /* Wait for data available on socket (with 100ms timeout) */
+    /* This prevents spinning while allowing responsiveness */
+    if (client->socket) {
+      GError *wait_error = NULL;
+      gboolean ready = g_socket_condition_wait (client->socket, G_IO_IN, 
+          NULL, &wait_error);
+      
+      if (wait_error) {
+        GST_WARNING ("Socket wait error: %s", wait_error->message);
+        g_error_free (wait_error);
+        break;
+      }
+      
+      if (!ready) {
+        continue;  /* Timeout, try again */
+      }
+    }
+    
+    /* Data available - process it */
     gboolean processed;
     
     if (src) {
       g_mutex_lock (&src->clients_lock);
     }
     
+    /* Buffered input handles TCP fragmentation */
     processed = rtmp2_client_process_data (client, &error);
     
     if (src) {
@@ -427,13 +445,12 @@ client_read_thread_func (gpointer user_data)
     }
     
     if (!processed) {
-      /* No data available or EOF */
+      /* No complete data yet - wait for more */
       if (client->state == RTMP2_CLIENT_STATE_DISCONNECTED) {
         GST_INFO ("Client disconnected in read thread");
         break;
       }
-      /* Brief sleep to avoid spinning on WOULD_BLOCK */
-      g_usleep (1000);  /* 1ms */
+      g_usleep (1000);  /* 1ms before retry */
     }
   }
   
@@ -765,25 +782,19 @@ rtmp2_client_process_data (Rtmp2Client * client, GError ** error)
       client->handshake_complete = TRUE;
       client->state = RTMP2_CLIENT_STATE_CONNECTING;
       
-      /* CRITICAL: Switch socket to BLOCKING mode (like MediaMTX's net.Conn) */
-      /* This is THE key to making buffered synchronous reads work */
-      if (client->socket) {
-        g_socket_set_blocking (client->socket, TRUE);
-        GST_INFO ("Switched socket to BLOCKING mode for synchronous reads (MediaMTX pattern)");
-      }
-      
       /* Create buffered input stream NOW (after handshake) for chunk reads */
       /* This is like gortmplib's bufio.Reader - handles TCP fragmentation */
-      /* With BLOCKING socket, synchronous reads will wait for data */
+      /* Keep socket NON-BLOCKING to prevent blocking on writes */
       if (!client->buffered_input) {
         client->buffered_input = g_buffered_input_stream_new (client->input_stream);
         g_buffered_input_stream_set_buffer_size (
             G_BUFFERED_INPUT_STREAM (client->buffered_input), 65536);
-        GST_INFO ("Created 64KB buffered input stream (like bufio.Reader)");
+        GST_INFO ("Created 64KB buffered input stream for TCP fragmentation handling");
       }
       
-      /* Start dedicated read thread (MediaMTX pattern) */
-      /* Thread will do blocking reads - waits for data like gortmplib goroutine */
+      /* Start dedicated read thread */
+      /* Socket stays NON-BLOCKING so writes don't block */
+      /* Thread will poll with g_socket_condition_wait for data */
       client->thread_running = TRUE;
       client->read_thread = g_thread_new ("rtmp-client-reader", 
           client_read_thread_func, client);
@@ -794,7 +805,7 @@ rtmp2_client_process_data (Rtmp2Client * client, GError ** error)
         return FALSE;
       }
       
-      GST_INFO ("Started dedicated read thread with BLOCKING socket (MediaMTX pattern)");
+      GST_INFO ("Started dedicated read thread (non-blocking socket + polling)");
     } else {
       GST_WARNING ("Unknown handshake state: %d", client->handshake.state);
     }
