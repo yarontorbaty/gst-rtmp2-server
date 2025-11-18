@@ -356,6 +356,8 @@ rtmp2_client_new (GSocketConnection * connection, GIOStream * io_stream)
   /* Don't create buffered_input yet - will create after handshake */
   /* Handshake needs non-blocking reads, buffered input is for chunks only */
   client->buffered_input = NULL;
+  client->read_thread = NULL;
+  client->thread_running = FALSE;
 
   client->state = RTMP2_CLIENT_STATE_HANDSHAKE;
   rtmp2_handshake_init (&client->handshake);
@@ -379,6 +381,64 @@ rtmp2_client_new (GSocketConnection * connection, GIOStream * io_stream)
   client->timestamp_nano_offset = 0;
 
   return client;
+}
+
+/* Dedicated read thread function - like gortmplib's goroutine */  
+/* Continuously reads and processes data with synchronous buffered I/O */
+static gpointer
+client_read_thread_func (gpointer user_data)
+{
+  Rtmp2Client *client = (Rtmp2Client *) user_data;
+  GError *error = NULL;
+  GstRtmp2ServerSrc *src = NULL;
+  
+  if (client->user_data) {
+    src = GST_RTMP2_SERVER_SRC (client->user_data);
+  }
+  
+  GST_INFO ("Client read thread started (MediaMTX pattern: sync buffered reads)");
+  
+  /* Continuous read loop - like gortmplib's for loop */
+  /* Key: synchronous reads with GBufferedInputStream handle TCP fragmentation */
+  while (client->thread_running &&
+         client->state != RTMP2_CLIENT_STATE_DISCONNECTED &&
+         client->state != RTMP2_CLIENT_STATE_ERROR) {
+    
+    /* Call rtmp2_client_process_data which reads from buffered_input */
+    /* With buffered input, chunks split across TCP packets are reassembled */
+    gboolean processed;
+    
+    if (src) {
+      g_mutex_lock (&src->clients_lock);
+    }
+    
+    processed = rtmp2_client_process_data (client, &error);
+    
+    if (src) {
+      g_mutex_unlock (&src->clients_lock);
+    }
+    
+    if (error) {
+      GST_WARNING ("Error in read thread: %s", error->message);
+      g_error_free (error);
+      error = NULL;
+      client->state = RTMP2_CLIENT_STATE_ERROR;
+      break;
+    }
+    
+    if (!processed) {
+      /* No data available or EOF */
+      if (client->state == RTMP2_CLIENT_STATE_DISCONNECTED) {
+        GST_INFO ("Client disconnected in read thread");
+        break;
+      }
+      /* Brief sleep to avoid spinning on WOULD_BLOCK */
+      g_usleep (1000);  /* 1ms */
+    }
+  }
+  
+  GST_INFO ("Client read thread exiting");
+  return NULL;
 }
 
 /* Callback for continuous reading from client socket */
@@ -489,6 +549,14 @@ rtmp2_client_free (Rtmp2Client * client)
 {
   if (!client)
     return;
+
+  /* Stop dedicated read thread first */
+  if (client->read_thread) {
+    GST_INFO ("Stopping client read thread");
+    client->thread_running = FALSE;
+    g_thread_join (client->read_thread);
+    client->read_thread = NULL;
+  }
 
   if (client->read_source) {
     g_source_destroy (client->read_source);
@@ -706,15 +774,18 @@ rtmp2_client_process_data (Rtmp2Client * client, GError ** error)
         GST_INFO ("Created 64KB buffered input stream for chunk reading");
       }
       
-      /* Start async reading now that handshake is complete */
-      if (client->user_data) {
-        GstRtmp2ServerSrc *src = GST_RTMP2_SERVER_SRC (client->user_data);
-        if (!rtmp2_client_start_reading (client, src->context)) {
-          GST_WARNING ("Failed to start async reading after handshake");
-        } else {
-          GST_INFO ("Started async reading after handshake completion");
-        }
+      /* Start dedicated read thread (MediaMTX pattern) instead of async callbacks */
+      client->thread_running = TRUE;
+      client->read_thread = g_thread_new ("rtmp-client-reader", 
+          client_read_thread_func, client);
+      
+      if (!client->read_thread) {
+        GST_WARNING ("Failed to create read thread");
+        client->state = RTMP2_CLIENT_STATE_ERROR;
+        return FALSE;
       }
+      
+      GST_INFO ("Started dedicated read thread (MediaMTX pattern) after handshake");
     } else {
       GST_WARNING ("Unknown handshake state: %d", client->handshake.state);
     }
