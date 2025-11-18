@@ -353,6 +353,10 @@ rtmp2_client_new (GSocketConnection * connection, GIOStream * io_stream)
   client->input_stream = g_io_stream_get_input_stream (stream_to_use);
   client->output_stream = g_io_stream_get_output_stream (stream_to_use);
 
+  /* Don't create buffered_input yet - will create after handshake */
+  /* Handshake needs non-blocking reads, buffered input is for chunks only */
+  client->buffered_input = NULL;
+
   client->state = RTMP2_CLIENT_STATE_HANDSHAKE;
   rtmp2_handshake_init (&client->handshake);
   rtmp2_chunk_parser_init (&client->chunk_parser);
@@ -385,6 +389,8 @@ rtmp2_client_read_cb (GSocket * socket, GIOCondition condition, gpointer user_da
   GError *error = NULL;
   gint read_attempts = 0;
   const gint max_reads = 100;  /* Drain up to 100 chunks per callback */
+  static gint64 last_chunk_clear = 0;
+  gint64 now = g_get_monotonic_time();
 
   /* Check if client is disconnected */
   if (client->state == RTMP2_CLIENT_STATE_DISCONNECTED ||
@@ -398,6 +404,18 @@ rtmp2_client_read_cb (GSocket * socket, GIOCondition condition, gpointer user_da
     GST_WARNING ("Socket error or hangup detected");
     client->state = RTMP2_CLIENT_STATE_DISCONNECTED;
     return G_SOURCE_REMOVE;
+  }
+
+  /* CRITICAL FIX: Clear stale incomplete chunks every 100ms */
+  /* This prevents old control message fragments from blocking new video data */
+  if (client->state == RTMP2_CLIENT_STATE_PUBLISHING && 
+      (now - last_chunk_clear) > 100000) {  /* 100ms */
+    guint incomplete = g_hash_table_size(client->chunk_parser.chunk_streams);
+    if (incomplete > 0) {
+      GST_INFO ("Clearing %u stale incomplete chunks to unblock video processing", incomplete);
+      g_hash_table_remove_all(client->chunk_parser.chunk_streams);
+    }
+    last_chunk_clear = now;
   }
 
   /* Read multiple times to drain available data - fast and simple */
@@ -449,20 +467,19 @@ rtmp2_client_start_reading (Rtmp2Client * client, GMainContext * context)
   g_source_set_callback (client->read_source,
       (GSourceFunc) rtmp2_client_read_cb, client, NULL);
   
-  /* Set priority to ensure it runs frequently */
+  /* Set high priority to process I/O events quickly */
   g_source_set_priority (client->read_source, G_PRIORITY_HIGH);
   
   g_source_attach (client->read_source, context);
 
-  /* ALSO add a timeout source as backup to poll every 5ms */
-  /* This ensures we don't miss data if G_IO_IN doesn't retrigger */
-  client->timeout_source = g_timeout_source_new (5);  /* 5ms polling */
+  /* Add 50ms timeout as backup - balances responsiveness vs CPU usage */
+  /* G_IO_IN may not retrigger reliably, timeout ensures we keep checking */
+  client->timeout_source = g_timeout_source_new (50);  /* 50ms - 10x slower than before */
   g_source_set_callback (client->timeout_source,
       (GSourceFunc) rtmp2_client_read_cb, client, NULL);
-  g_source_set_priority (client->timeout_source, G_PRIORITY_DEFAULT);
   g_source_attach (client->timeout_source, context);
-
-  GST_DEBUG ("Started continuous reading for client (socket=%p) with G_IO_IN + 5ms timeout", 
+  
+  GST_INFO ("Started async reading for client (socket=%p) with G_IO_IN + 50ms timeout", 
       client->socket);
   return TRUE;
 }
@@ -495,6 +512,8 @@ rtmp2_client_free (Rtmp2Client * client)
   if (client->server_caps)
     rtmp2_enhanced_capabilities_free (client->server_caps);
 
+  if (client->buffered_input)
+    g_object_unref (client->buffered_input);
   if (client->io_stream)
     g_object_unref (client->io_stream);
   if (client->connection)
@@ -678,6 +697,15 @@ rtmp2_client_process_data (Rtmp2Client * client, GError ** error)
       client->handshake_complete = TRUE;
       client->state = RTMP2_CLIENT_STATE_CONNECTING;
       
+      /* Create buffered input stream NOW (after handshake) for chunk reads */
+      /* This is like gortmplib's bufio.Reader - handles TCP fragmentation */
+      if (!client->buffered_input) {
+        client->buffered_input = g_buffered_input_stream_new (client->input_stream);
+        g_buffered_input_stream_set_buffer_size (
+            G_BUFFERED_INPUT_STREAM (client->buffered_input), 65536);
+        GST_INFO ("Created 64KB buffered input stream for chunk reading");
+      }
+      
       /* Start async reading now that handshake is complete */
       if (client->user_data) {
         GstRtmp2ServerSrc *src = GST_RTMP2_SERVER_SRC (client->user_data);
@@ -693,17 +721,16 @@ rtmp2_client_process_data (Rtmp2Client * client, GError ** error)
     return TRUE;
   }
 
-  /* Read RTMP chunks */
+  /* Read RTMP chunks using buffered input (handles TCP fragmentation) */
   GST_DEBUG ("Reading RTMP chunks (handshake complete)");
-  if (G_IS_POLLABLE_INPUT_STREAM (client->input_stream)) {
-    bytes_read = g_pollable_input_stream_read_nonblocking (
-        G_POLLABLE_INPUT_STREAM (client->input_stream),
-        buffer, sizeof (buffer), NULL, error);
-  } else {
-    bytes_read = g_input_stream_read (client->input_stream, buffer,
-        sizeof (buffer), NULL, error);
-  }
-  GST_DEBUG ("Read %zd bytes of chunk data", bytes_read);
+  
+  /* CRITICAL: Use buffered_input like Go's bufio.Reader to handle TCP fragmentation */
+  /* GBufferedInputStream internally buffers and reassembles fragmented TCP packets */
+  /* This allows chunks split across multiple packets to be read as complete units */
+  bytes_read = g_input_stream_read (client->buffered_input, buffer,
+      sizeof (buffer), NULL, error);
+  
+  GST_DEBUG ("Read %zd bytes of chunk data from buffered stream", bytes_read);
   if (bytes_read < 0) {
     /* Check if it's WOULD_BLOCK (no data available yet) */
     if (error && *error && g_error_matches (*error, G_IO_ERROR, G_IO_ERROR_WOULD_BLOCK)) {

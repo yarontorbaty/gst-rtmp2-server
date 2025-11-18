@@ -45,9 +45,12 @@ typedef struct _Rtmp2Client {
   GSocketConnection *connection;
   GIOStream *io_stream;
   GInputStream *input_stream;
+  GInputStream *buffered_input;  /* Buffered wrapper - like bufio.Reader */
   GOutputStream *output_stream;
   GSource *read_source;
   GSource *timeout_source;
+  GThread *read_thread;  /* Dedicated read thread like gortmplib goroutine */
+  gboolean thread_running;
   
   Rtmp2ClientState state;
   Rtmp2Handshake handshake;
