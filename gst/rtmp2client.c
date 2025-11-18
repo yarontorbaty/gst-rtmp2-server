@@ -792,16 +792,28 @@ rtmp2_client_process_data (Rtmp2Client * client, GError ** error)
     return TRUE;
   }
 
-  /* Read RTMP chunks using buffered input (handles TCP fragmentation) */
+  /* Read RTMP chunks */
   GST_DEBUG ("Reading RTMP chunks (handshake complete)");
   
-  /* CRITICAL: Use buffered_input like Go's bufio.Reader to handle TCP fragmentation */
-  /* GBufferedInputStream internally buffers and reassembles fragmented TCP packets */
-  /* This allows chunks split across multiple packets to be read as complete units */
-  bytes_read = g_input_stream_read (client->buffered_input, buffer,
-      sizeof (buffer), NULL, error);
-  
-  GST_DEBUG ("Read %zd bytes of chunk data from buffered stream", bytes_read);
+  /* Use buffered_input if available (after handshake), otherwise direct input */
+  /* buffered_input is created when read thread starts - handles TCP fragmentation */
+  if (client->buffered_input) {
+    /* Buffered input - synchronous read for read thread (like bufio.Reader) */
+    bytes_read = g_input_stream_read (client->buffered_input, buffer,
+        sizeof (buffer), NULL, error);
+    GST_DEBUG ("Read %zd bytes from buffered stream", bytes_read);
+  } else {
+    /* Direct input - non-blocking for handshake phase */
+    if (G_IS_POLLABLE_INPUT_STREAM (client->input_stream)) {
+      bytes_read = g_pollable_input_stream_read_nonblocking (
+          G_POLLABLE_INPUT_STREAM (client->input_stream),
+          buffer, sizeof (buffer), NULL, error);
+    } else {
+      bytes_read = g_input_stream_read (client->input_stream, buffer,
+          sizeof (buffer), NULL, error);
+    }
+    GST_DEBUG ("Read %zd bytes from direct stream", bytes_read);
+  }
   if (bytes_read < 0) {
     /* Check if it's WOULD_BLOCK (no data available yet) */
     if (error && *error && g_error_matches (*error, G_IO_ERROR, G_IO_ERROR_WOULD_BLOCK)) {
