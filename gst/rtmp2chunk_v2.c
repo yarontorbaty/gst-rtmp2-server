@@ -413,24 +413,48 @@ rtmp2_chunk_parser_v2_read_message (Rtmp2ChunkParserV2 *parser,
         return FALSE;
       }
       
-      /* For type 0/1/2, allocate buffer if new message */
+      /* For type 0/1/2, (re)allocate buffer for new message */
       if (msg->bytes_received == 0 || chunk_type == RTMP2_CHUNK_TYPE_0) {
-        if (msg->buffer) {
-          gst_buffer_unref (msg->buffer);
+        /* Handle zero-length messages (empty control messages) */
+        if (msg->message_length == 0) {
+          GST_DEBUG ("Zero-length message for type=%d stream=%d - returning empty complete message",
+              msg->message_type, chunk_stream_id);
+          /* Zero-length message is already complete */
+          msg->buffer = gst_buffer_new_allocate (NULL, 0, NULL);
+          msg->bytes_received = 0;
+          msg->complete = TRUE;
+          /* Remove from hash table and return */
+          g_hash_table_steal (parser->chunk_streams, GUINT_TO_POINTER (chunk_stream_id));
+          *message = msg;
+          return TRUE;
         }
         
         /* Sanity check message length */
         if (msg->message_length > 10 * 1024 * 1024) {  /* 10MB max */
-          GST_WARNING ("Suspicious message length: %u bytes, rejecting", msg->message_length);
-          g_set_error (error, GST_CORE_ERROR, GST_CORE_ERROR_FAILED,
-              "Message too large: %u bytes", msg->message_length);
-          return FALSE;
+          GST_WARNING ("Suspicious message length: %u bytes (type=%d, csid=%d), skipping this stream",
+              msg->message_length, msg->message_type, chunk_stream_id);
+          /* Remove corrupted message and try next chunk */
+          g_hash_table_remove (parser->chunk_streams, GUINT_TO_POINTER (chunk_stream_id));
+          continue;  /* Try to read next message */
+        }
+        
+        /* Normal message - allocate buffer */
+        if (msg->buffer) {
+          gst_buffer_unref (msg->buffer);
         }
         
         msg->buffer = gst_buffer_new_allocate (NULL, msg->message_length, NULL);
         msg->bytes_received = 0;
         msg->complete = FALSE;
-        GST_DEBUG ("Allocated %u byte buffer for new message", msg->message_length);
+        GST_DEBUG ("Allocated %u byte buffer for message type=%d", msg->message_length, msg->message_type);
+      }
+    } else {
+      /* Type 3 - ensure we have a valid message to continue */
+      if (!msg->buffer || msg->message_length == 0) {
+        GST_WARNING ("Type 3 continuation but no valid message in progress (csid=%d), removing",
+            chunk_stream_id);
+        g_hash_table_remove (parser->chunk_streams, GUINT_TO_POINTER (chunk_stream_id));
+        continue;  /* Try to read next message */
       }
     }
     

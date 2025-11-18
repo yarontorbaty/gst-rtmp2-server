@@ -870,9 +870,18 @@ rtmp2_client_process_data (Rtmp2Client * client, GError ** error)
         msg->message_type, msg->message_length, msg->timestamp, msg->message_stream_id, msg->buffer);
 
     if (!msg->buffer) {
-      GST_WARNING ("Message type %d has no buffer, skipping", msg->message_type);
+      GST_WARNING ("Message type %d (length=%u, csid=%d) has no buffer, skipping",
+          msg->message_type, msg->message_length, msg->chunk_stream_id);
       rtmp2_chunk_message_free (msg);
-      return TRUE;
+      return TRUE;  /* Continue reading more messages */
+    }
+    
+    /* Skip control messages with invalid types */
+    if (msg->message_type == 0 || msg->message_length == 0) {
+      GST_DEBUG ("Skipping control message type=%d length=%u",
+          msg->message_type, msg->message_length);
+      rtmp2_chunk_message_free (msg);
+      return TRUE;  /* Continue reading more messages */
     }
 
     GST_INFO ("Processing message: type=%d, length=%u", msg->message_type, msg->message_length);
