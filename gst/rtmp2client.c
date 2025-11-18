@@ -765,16 +765,25 @@ rtmp2_client_process_data (Rtmp2Client * client, GError ** error)
       client->handshake_complete = TRUE;
       client->state = RTMP2_CLIENT_STATE_CONNECTING;
       
+      /* CRITICAL: Switch socket to BLOCKING mode (like MediaMTX's net.Conn) */
+      /* This is THE key to making buffered synchronous reads work */
+      if (client->socket) {
+        g_socket_set_blocking (client->socket, TRUE);
+        GST_INFO ("Switched socket to BLOCKING mode for synchronous reads (MediaMTX pattern)");
+      }
+      
       /* Create buffered input stream NOW (after handshake) for chunk reads */
       /* This is like gortmplib's bufio.Reader - handles TCP fragmentation */
+      /* With BLOCKING socket, synchronous reads will wait for data */
       if (!client->buffered_input) {
         client->buffered_input = g_buffered_input_stream_new (client->input_stream);
         g_buffered_input_stream_set_buffer_size (
             G_BUFFERED_INPUT_STREAM (client->buffered_input), 65536);
-        GST_INFO ("Created 64KB buffered input stream for chunk reading");
+        GST_INFO ("Created 64KB buffered input stream (like bufio.Reader)");
       }
       
-      /* Start dedicated read thread (MediaMTX pattern) instead of async callbacks */
+      /* Start dedicated read thread (MediaMTX pattern) */
+      /* Thread will do blocking reads - waits for data like gortmplib goroutine */
       client->thread_running = TRUE;
       client->read_thread = g_thread_new ("rtmp-client-reader", 
           client_read_thread_func, client);
@@ -785,7 +794,7 @@ rtmp2_client_process_data (Rtmp2Client * client, GError ** error)
         return FALSE;
       }
       
-      GST_INFO ("Started dedicated read thread (MediaMTX pattern) after handshake");
+      GST_INFO ("Started dedicated read thread with BLOCKING socket (MediaMTX pattern)");
     } else {
       GST_WARNING ("Unknown handshake state: %d", client->handshake.state);
     }
