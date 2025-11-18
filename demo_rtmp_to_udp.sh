@@ -51,9 +51,10 @@ echo ""
 
 # Start GStreamer RTMP→UDP bridge
 echo "▶️  Starting RTMP server (port 1935) → UDP output (port 5000)..."
-gst-launch-1.0 -q rtmp2serversrc port=1935 ! \
-    flvdemux ! h264parse ! mpegtsmux ! \
-    udpsink host=127.0.0.1 port=5000 2>&1 | \
+gst-launch-1.0 -q rtmp2serversrc port=1935 ! flvdemux name=d \
+    d.video ! queue ! h264parse ! mux. \
+    d.audio ! queue ! aacparse ! mux. \
+    mpegtsmux name=mux ! udpsink host=127.0.0.1 port=5000 2>&1 | \
     grep -E "Setting|ERROR" &
 GST_PID=$!
 sleep 2
