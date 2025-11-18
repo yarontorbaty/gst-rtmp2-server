@@ -36,9 +36,10 @@ trap cleanup SIGINT SIGTERM EXIT
 
 # Start GStreamer RTMP→SRT bridge (listener mode)
 echo "▶️  Starting RTMP server (port 1935) → SRT output (port 8888)..."
-gst-launch-1.0 -q rtmp2serversrc port=1935 ! \
-    flvdemux ! h264parse ! mpegtsmux ! \
-    srtsink uri="srt://:8888?mode=listener&latency=200" 2>&1 | \
+gst-launch-1.0 -q rtmp2serversrc port=1935 ! flvdemux name=d \
+    d.video ! queue ! h264parse ! mux. \
+    d.audio ! queue ! aacparse ! mux. \
+    mpegtsmux name=mux ! srtsink uri="srt://:8888?mode=listener&latency=200" 2>&1 | \
     grep -E "Setting|ERROR" &
 GST_PID=$!
 sleep 3
@@ -123,8 +124,9 @@ echo "=================================================="
 echo ""
 
 ffmpeg -re -f lavfi -i testsrc=size=1280x720:rate=30 \
+    -f lavfi -i sine=frequency=1000:sample_rate=48000 \
     -c:v libx264 -preset ultrafast -tune zerolatency \
-    -g 30 -b:v 2M -maxrate 2M -bufsize 4M \
+    -g 30 -b:v 2M -maxrate 2M -bufsize 4M -c:a aac -b:a 192k \
     -f flv rtmp://localhost:1935/live/demo 2>&1 | \
     grep --line-buffered "frame=" || true
 
