@@ -635,8 +635,18 @@ gst_rtmp2_server_src_create (GstPushSrc * psrc, GstBuffer ** buf)
          src->active_client->state == RTMP2_CLIENT_STATE_DISCONNECTED)) {
       /* Check for FLV tags in the parser */
       /* Allow reading even after disconnection to drain remaining buffered tags */
-      flv_tags = src->active_client->flv_parser.pending_tags;
-      gint pending_count = g_list_length (flv_tags);
+      Rtmp2FlvParser *flv_parser = &src->active_client->flv_parser;
+      gint pending_count = 0;
+      g_mutex_lock (&flv_parser->pending_tags_lock);
+      pending_count = g_list_length (flv_parser->pending_tags);
+      if (flv_parser->pending_tags) {
+        flv_tags = flv_parser->pending_tags;
+        flv_parser->pending_tags =
+            g_list_remove_link (flv_parser->pending_tags, flv_tags);
+      } else {
+        flv_tags = NULL;
+      }
+      g_mutex_unlock (&flv_parser->pending_tags_lock);
       if (pending_count > 0) {
         GST_INFO_OBJECT (src, "📦 FOUND %d pending FLV tags in queue", pending_count);
       } else if (retry_count % 100 == 0) {
@@ -646,10 +656,6 @@ gst_rtmp2_server_src_create (GstPushSrc * psrc, GstBuffer ** buf)
       
       if (flv_tags) {
         tag = (Rtmp2FlvTag *) flv_tags->data;
-        src->active_client->flv_parser.pending_tags =
-            g_list_remove_link (src->active_client->flv_parser.pending_tags,
-            flv_tags);
-
         if (tag->data && gst_buffer_get_size (tag->data) > 0) {
           gsize buf_size = gst_buffer_get_size (tag->data);
           static gint frame_num = 0;
@@ -678,7 +684,10 @@ gst_rtmp2_server_src_create (GstPushSrc * psrc, GstBuffer ** buf)
       
       /* Check if client disconnected with no more pending data - signal EOS */
       if (src->active_client->state == RTMP2_CLIENT_STATE_DISCONNECTED) {
-        gint remaining = g_list_length (src->active_client->flv_parser.pending_tags);
+        gint remaining = 0;
+        g_mutex_lock (&src->active_client->flv_parser.pending_tags_lock);
+        remaining = g_list_length (src->active_client->flv_parser.pending_tags);
+        g_mutex_unlock (&src->active_client->flv_parser.pending_tags_lock);
         if (remaining == 0) {
           GST_INFO_OBJECT (src, "Client disconnected and all tags drained - returning EOS");
           g_mutex_unlock (&src->clients_lock);

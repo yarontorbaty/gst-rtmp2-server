@@ -87,6 +87,7 @@ typedef struct {
   GList *pending_tags;
   gboolean have_video_caps;
   gboolean have_audio_caps;
+  GMutex pending_tags_lock;
 } Rtmp2FlvParser;
 
 void rtmp2_flv_parser_init (Rtmp2FlvParser *parser);

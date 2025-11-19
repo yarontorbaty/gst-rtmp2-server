@@ -201,6 +201,44 @@ rtmp2_fast_buffer_read_bytes (Rtmp2FastBuffer *buf, guint8 *dest, gsize size)
   return TRUE;
 }
 
+static inline void
+rtmp2_chunk_v2_trace_chunk (const gchar *stage, guint8 chunk_stream_id,
+    Rtmp2ChunkType chunk_type, Rtmp2ChunkMessage *msg, gsize payload)
+{
+  GST_TRACE ("[pkt %s] csid=%u fmt=%d ts=%u delta=%u len=%u type=%u received=%zu/%u payload=%zu",
+      stage, chunk_stream_id, chunk_type,
+      msg ? msg->timestamp : 0,
+      msg ? msg->timestamp_delta : 0,
+      msg ? msg->message_length : 0,
+      msg ? msg->message_type : 0,
+      msg ? msg->bytes_received : 0,
+      msg ? msg->message_length : 0,
+      payload);
+}
+
+static Rtmp2ChunkMessage *
+rtmp2_chunk_message_detach_output (Rtmp2ChunkMessage *state)
+{
+  Rtmp2ChunkMessage *out = rtmp2_chunk_message_new ();
+
+  out->chunk_stream_id = state->chunk_stream_id;
+  out->chunk_type = state->chunk_type;
+  out->timestamp = state->timestamp;
+  out->timestamp_delta = state->timestamp_delta;
+  out->message_length = state->message_length;
+  out->message_type = state->message_type;
+  out->message_stream_id = state->message_stream_id;
+  out->buffer = state->buffer;
+  out->bytes_received = state->bytes_received;
+  out->complete = TRUE;
+
+  state->buffer = NULL;
+  state->bytes_received = 0;
+  state->complete = FALSE;
+
+  return out;
+}
+
 /* ===== V2 Parser Implementation ===== */
 /* Following SRS's recv_interlaced_message pattern */
 
@@ -214,12 +252,14 @@ rtmp2_chunk_parser_v2_init (Rtmp2ChunkParserV2 *parser, GInputStream *stream)
   parser->chunk_streams = g_hash_table_new_full (g_direct_hash, g_direct_equal,
       NULL, (GDestroyNotify) rtmp2_chunk_message_free);
   parser->buffer = rtmp2_fast_buffer_new (stream, 65536);  /* 64KB initial buffer */
+  memset (&parser->diagnostics, 0, sizeof (parser->diagnostics));
   GST_INFO ("Parser V2 initialized with 64KB buffer");
 }
 
 void
 rtmp2_chunk_parser_v2_clear (Rtmp2ChunkParserV2 *parser)
 {
+  rtmp2_chunk_parser_v2_dump_diagnostics (parser);
   if (parser->chunk_streams) {
     g_hash_table_destroy (parser->chunk_streams);
     parser->chunk_streams = NULL;
@@ -399,17 +439,20 @@ rtmp2_chunk_parser_v2_read_message (Rtmp2ChunkParserV2 *parser,
       return FALSE;
     }
     
+    parser->diagnostics.total_chunks++;
+    rtmp2_chunk_v2_trace_chunk ("basic-header", chunk_stream_id, chunk_type, NULL, 0);
+    
     /* 2. Get or create message for this chunk stream */
     msg = (Rtmp2ChunkMessage *) g_hash_table_lookup (parser->chunk_streams,
         GUINT_TO_POINTER (chunk_stream_id));
     
     if (!msg) {
-      /* SRS validation: Type 2/3 cannot start NEW chunk streams */
-      /* This catches garbage data being interpreted as headers */
-      if (chunk_type == RTMP2_CHUNK_TYPE_2 || chunk_type == RTMP2_CHUNK_TYPE_3) {
-        GST_WARNING ("Fresh chunk stream %d with Type %d - skipping likely garbage data",
+      if (chunk_type != RTMP2_CHUNK_TYPE_0) {
+        parser->diagnostics.invalid_fresh_headers++;
+        parser->diagnostics.dropped_chunks++;
+        GST_WARNING ("Fresh chunk stream %d started with fmt=%d - invalid per RTMP spec, dropping chunk",
             chunk_stream_id, chunk_type);
-        continue;  /* Skip this chunk and try to read next valid one */
+        continue;
       }
       
       GST_DEBUG ("Creating new message for chunk stream %d", chunk_stream_id);
@@ -422,8 +465,13 @@ rtmp2_chunk_parser_v2_read_message (Rtmp2ChunkParserV2 *parser,
           chunk_stream_id, msg->bytes_received, msg->message_length);
     }
     
+    rtmp2_chunk_v2_trace_chunk ("chunk-start", chunk_stream_id, chunk_type, msg, 0);
+    
     /* 3. Parse message header (if not type 3) */
     if (chunk_type != RTMP2_CHUNK_TYPE_3) {
+      msg->chunk_stream_id = chunk_stream_id;
+      msg->chunk_type = chunk_type;
+      
       if (!parse_message_header_v2 (buf, chunk_type, msg, error)) {
         return FALSE;
       }
@@ -432,6 +480,7 @@ rtmp2_chunk_parser_v2_read_message (Rtmp2ChunkParserV2 *parser,
       if (msg->bytes_received == 0 || chunk_type == RTMP2_CHUNK_TYPE_0) {
         /* If Type 0 on partially received message, abandon old and start new */
         if (msg->bytes_received > 0 && chunk_type == RTMP2_CHUNK_TYPE_0) {
+          parser->diagnostics.restarts_from_type0++;
           GST_DEBUG ("Type 0 on partially complete message (csid=%d) - starting fresh",
               chunk_stream_id);
           if (msg->buffer) {
@@ -443,23 +492,21 @@ rtmp2_chunk_parser_v2_read_message (Rtmp2ChunkParserV2 *parser,
         if (msg->message_length == 0) {
           GST_DEBUG ("Zero-length message for type=%d stream=%d - returning empty complete message",
               msg->message_type, chunk_stream_id);
-          /* Zero-length message is already complete */
           msg->buffer = gst_buffer_new_allocate (NULL, 0, NULL);
           msg->bytes_received = 0;
           msg->complete = TRUE;
-          /* Remove from hash table and return */
-          g_hash_table_steal (parser->chunk_streams, GUINT_TO_POINTER (chunk_stream_id));
-          *message = msg;
+          parser->diagnostics.completed_messages++;
+          *message = rtmp2_chunk_message_detach_output (msg);
           return TRUE;
         }
         
         /* Sanity check message length */
         if (msg->message_length > 10 * 1024 * 1024) {  /* 10MB max */
+          parser->diagnostics.dropped_chunks++;
           GST_WARNING ("Suspicious message length: %u bytes (type=%d, csid=%d), skipping this stream",
               msg->message_length, msg->message_type, chunk_stream_id);
-          /* Remove corrupted message and try next chunk */
           g_hash_table_remove (parser->chunk_streams, GUINT_TO_POINTER (chunk_stream_id));
-          continue;  /* Try to read next message */
+          continue;
         }
         
         /* Normal message - allocate buffer */
@@ -473,12 +520,16 @@ rtmp2_chunk_parser_v2_read_message (Rtmp2ChunkParserV2 *parser,
         GST_DEBUG ("Allocated %u byte buffer for message type=%d", msg->message_length, msg->message_type);
       }
     } else {
+      msg->chunk_type = chunk_type;
       /* Type 3 - ensure we have a valid message to continue */
       if (!msg->buffer || msg->message_length == 0) {
-        GST_WARNING ("Type 3 continuation but no valid message in progress (csid=%d), removing",
+        parser->diagnostics.continuations_without_state++;
+        parser->diagnostics.dropped_chunks++;
+        GST_WARNING ("Type 3 continuation but no valid message in progress (csid=%d) - dropping chunk",
             chunk_stream_id);
-        g_hash_table_remove (parser->chunk_streams, GUINT_TO_POINTER (chunk_stream_id));
-        continue;  /* Try to read next message */
+        g_set_error (error, GST_CORE_ERROR, GST_CORE_ERROR_FAILED,
+            "Type 3 continuation without an in-flight message (csid=%d)", chunk_stream_id);
+        return FALSE;
       }
     }
     
@@ -488,6 +539,7 @@ rtmp2_chunk_parser_v2_read_message (Rtmp2ChunkParserV2 *parser,
     
     GST_DEBUG ("Reading chunk payload: chunk_size=%u, bytes_left=%zu, payload=%zu",
         parser->config.chunk_size, bytes_left, chunk_payload_size);
+    rtmp2_chunk_v2_trace_chunk ("chunk-payload", chunk_stream_id, chunk_type, msg, chunk_payload_size);
     
     /* 5. Ensure payload bytes available - KEY DIFFERENCE FROM V1 */
     /* V1 would process partial payload, V2 waits for complete chunk */
@@ -515,13 +567,13 @@ rtmp2_chunk_parser_v2_read_message (Rtmp2ChunkParserV2 *parser,
     
     /* 7. Check if message is complete */
     if (msg->bytes_received >= msg->message_length) {
+      parser->diagnostics.completed_messages++;
       GST_INFO ("✅ Message complete! type=%u, length=%u, timestamp=%u",
           msg->message_type, msg->message_length, msg->timestamp);
       msg->complete = TRUE;
+      rtmp2_chunk_v2_trace_chunk ("message-complete", chunk_stream_id, chunk_type, msg, 0);
       
-      /* Remove from hash table and return */
-      g_hash_table_steal (parser->chunk_streams, GUINT_TO_POINTER (chunk_stream_id));
-      *message = msg;
+      *message = rtmp2_chunk_message_detach_output (msg);
       return TRUE;
     }
     
@@ -532,5 +584,23 @@ rtmp2_chunk_parser_v2_read_message (Rtmp2ChunkParserV2 *parser,
   
   /* Unreachable */
   return FALSE;
+}
+
+void
+rtmp2_chunk_parser_v2_dump_diagnostics (Rtmp2ChunkParserV2 *parser)
+{
+  if (!parser)
+    return;
+  
+  GST_INFO ("RTMP parser diagnostics: chunks=%" G_GUINT64_FORMAT
+      " completed=%" G_GUINT64_FORMAT " dropped=%" G_GUINT64_FORMAT
+      " invalid_fresh=%" G_GUINT64_FORMAT " continuations=%" G_GUINT64_FORMAT
+      " restarts=%" G_GUINT64_FORMAT,
+      parser->diagnostics.total_chunks,
+      parser->diagnostics.completed_messages,
+      parser->diagnostics.dropped_chunks,
+      parser->diagnostics.invalid_fresh_headers,
+      parser->diagnostics.continuations_without_state,
+      parser->diagnostics.restarts_from_type0);
 }
 

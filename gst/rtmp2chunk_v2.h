@@ -38,11 +38,21 @@ typedef struct {
   GInputStream *stream;  /* Source for reading more data */
 } Rtmp2FastBuffer;
 
+typedef struct {
+  guint64 total_chunks;
+  guint64 completed_messages;
+  guint64 dropped_chunks;
+  guint64 invalid_fresh_headers;
+  guint64 continuations_without_state;
+  guint64 restarts_from_type0;
+} Rtmp2ParserDiagnostics;
+
 /* V2 Parser - SRS-based with FastBuffer */
 typedef struct {
   Rtmp2ChunkConfig config;
   GHashTable *chunk_streams;  /* chunk_stream_id -> Rtmp2ChunkMessage */
   Rtmp2FastBuffer *buffer;
+  Rtmp2ParserDiagnostics diagnostics;
 } Rtmp2ChunkParserV2;
 
 /* FastBuffer operations */
@@ -62,6 +72,7 @@ void rtmp2_chunk_parser_v2_clear (Rtmp2ChunkParserV2 *parser);
 gboolean rtmp2_chunk_parser_v2_read_message (Rtmp2ChunkParserV2 *parser, 
                                               Rtmp2ChunkMessage **message,
                                               GError **error);
+void rtmp2_chunk_parser_v2_dump_diagnostics (Rtmp2ChunkParserV2 *parser);
 
 void rtmp2_chunk_v2_debug_init (void);
 
