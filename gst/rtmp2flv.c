@@ -68,15 +68,19 @@ rtmp2_flv_parser_init (Rtmp2FlvParser * parser)
   parser->pending_tags = NULL;
   parser->have_video_caps = FALSE;
   parser->have_audio_caps = FALSE;
+  g_mutex_init (&parser->pending_tags_lock);
 }
 
 void
 rtmp2_flv_parser_clear (Rtmp2FlvParser * parser)
 {
+  g_mutex_lock (&parser->pending_tags_lock);
   if (parser->pending_tags) {
     g_list_free_full (parser->pending_tags, (GDestroyNotify) rtmp2_flv_tag_free);
     parser->pending_tags = NULL;
   }
+  g_mutex_unlock (&parser->pending_tags_lock);
+  g_mutex_clear (&parser->pending_tags_lock);
 }
 
 gboolean

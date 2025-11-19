@@ -1161,10 +1161,11 @@ rtmp2_client_process_data (Rtmp2Client * client, GError ** error)
             tag->data_size = 11 + msg->message_length + 4;
             tag->data = flv_tag_buffer; /* Transfer ownership */
             
+            g_mutex_lock (&client->flv_parser.pending_tags_lock);
             client->flv_parser.pending_tags = 
                 g_list_append (client->flv_parser.pending_tags, tag);
-            
             gint pending_count = g_list_length (client->flv_parser.pending_tags);
+            g_mutex_unlock (&client->flv_parser.pending_tags_lock);
             GST_INFO ("✅ CREATED FLV TAG #%d: type=%s size=%u ts=%u (queue=%d tags)",
                 pending_count, 
                 tag->tag_type == RTMP2_FLV_TAG_VIDEO ? "video" : "audio",
