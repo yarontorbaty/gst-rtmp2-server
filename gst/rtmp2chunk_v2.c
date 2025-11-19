@@ -87,21 +87,28 @@ rtmp2_fast_buffer_ensure (Rtmp2FastBuffer *buf, gsize needed, GError **error)
     return TRUE;
   }
   
-  /* Compact buffer if needed (move unread data to start) */
-  if (buf->read_pos > 0) {
+  /* Calculate space at end of buffer */
+  gsize space_at_end = buf->capacity - buf->write_pos;
+  gsize space_needed = needed - available;
+  
+  /* Only compact if we actually need the space at the beginning */
+  /* This prevents mid-stream position resets that corrupt parsing */
+  if (buf->read_pos > 0 && space_at_end < space_needed) {
     if (available > 0) {
       memmove (buf->data, buf->data + buf->read_pos, available);
     }
     buf->write_pos = available;
     buf->read_pos = 0;
-    GST_DEBUG ("ensure: compacted buffer, new write_pos=%zu", buf->write_pos);
+    GST_DEBUG ("ensure: compacted buffer (necessary), new write_pos=%zu", buf->write_pos);
+    
+    /* Recalculate space at end after compaction */
+    space_at_end = buf->capacity - buf->write_pos;
   }
   
-  /* Grow buffer if needed */
-  gsize space_needed = needed - available;
-  if (buf->write_pos + space_needed > buf->capacity) {
+  /* Grow buffer if still not enough space */
+  if (space_at_end < space_needed) {
     gsize new_capacity = buf->capacity;
-    while (new_capacity < needed) {
+    while (new_capacity < (buf->write_pos + space_needed)) {
       new_capacity *= 2;
     }
     GST_INFO ("ensure: growing buffer from %zu to %zu bytes", buf->capacity, new_capacity);
@@ -397,6 +404,14 @@ rtmp2_chunk_parser_v2_read_message (Rtmp2ChunkParserV2 *parser,
         GUINT_TO_POINTER (chunk_stream_id));
     
     if (!msg) {
+      /* SRS validation: Type 2/3 cannot start NEW chunk streams */
+      /* This catches garbage data being interpreted as headers */
+      if (chunk_type == RTMP2_CHUNK_TYPE_2 || chunk_type == RTMP2_CHUNK_TYPE_3) {
+        GST_WARNING ("Fresh chunk stream %d with Type %d - skipping likely garbage data",
+            chunk_stream_id, chunk_type);
+        continue;  /* Skip this chunk and try to read next valid one */
+      }
+      
       GST_DEBUG ("Creating new message for chunk stream %d", chunk_stream_id);
       msg = rtmp2_chunk_message_new ();
       msg->chunk_stream_id = chunk_stream_id;
@@ -415,6 +430,15 @@ rtmp2_chunk_parser_v2_read_message (Rtmp2ChunkParserV2 *parser,
       
       /* For type 0/1/2, (re)allocate buffer for new message */
       if (msg->bytes_received == 0 || chunk_type == RTMP2_CHUNK_TYPE_0) {
+        /* If Type 0 on partially received message, abandon old and start new */
+        if (msg->bytes_received > 0 && chunk_type == RTMP2_CHUNK_TYPE_0) {
+          GST_DEBUG ("Type 0 on partially complete message (csid=%d) - starting fresh",
+              chunk_stream_id);
+          if (msg->buffer) {
+            gst_buffer_unref (msg->buffer);
+            msg->buffer = NULL;
+          }
+        }
         /* Handle zero-length messages (empty control messages) */
         if (msg->message_length == 0) {
           GST_DEBUG ("Zero-length message for type=%d stream=%d - returning empty complete message",
