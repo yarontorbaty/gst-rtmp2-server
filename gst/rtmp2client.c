@@ -1,6 +1,5 @@
-/*
- * GStreamer
- * Copyright (C) 2024 Your Name <your.email@example.com>
+/* GStreamer RTMP2 Server - Client Handler
+ * Copyright (C) 2024 Yaron Torbaty <yaron.torbaty@gmail.com>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Library General Public

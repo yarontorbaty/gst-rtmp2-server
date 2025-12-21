@@ -1,6 +1,5 @@
-/*
- * GStreamer
- * Copyright (C) 2024 Your Name <your.email@example.com>
+/* GStreamer RTMP2 Server Source Element
+ * Copyright (C) 2024 Yaron Torbaty <yaron.torbaty@gmail.com>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Library General Public
@@ -25,7 +24,28 @@
 
 G_BEGIN_DECLS
 
+/**
+ * GstRtmp2ServerSrc:
+ *
+ * RTMP server source element that listens for incoming RTMP connections
+ * and outputs the received audio/video stream.
+ *
+ * ## Example launch line
+ * |[
+ * gst-launch-1.0 rtmp2serversrc port=1935 ! filesink location=output.flv
+ * ]|
+ * This pipeline saves an incoming RTMP stream to a file.
+ *
+ * |[
+ * gst-launch-1.0 rtmp2serversrc port=1935 ! flvdemux name=demux \
+ *   demux.video ! queue ! h264parse ! mpegtsmux name=mux ! srtsink uri="srt://:9000?mode=listener" \
+ *   demux.audio ! queue ! aacparse ! mux.
+ * ]|
+ * This pipeline re-streams RTMP to SRT.
+ *
+ * Since: 1.26
+ */
+
 G_END_DECLS
 
 #endif /* __GST_RTMP2_SERVER_SRC_H__ */
-

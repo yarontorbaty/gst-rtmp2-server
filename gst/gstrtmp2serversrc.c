@@ -1,11 +1,45 @@
-/*
- * GStreamer RTMP2 Server Source - Typed Pads Implementation
- * Copyright (C) 2024 Your Name <your.email@example.com>
+/* GStreamer RTMP2 Server Source Element
+ * Copyright (C) 2024 Yaron Torbaty <yaron.torbaty@gmail.com>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Library General Public
  * License as published by the Free Software Foundation; either
  * version 2 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Library General Public License for more details.
+ *
+ * You should have received a copy of the GNU Library General Public
+ * License along with this library; if not, write to the
+ * Free Software Foundation, Inc., 51 Franklin St, Fifth Floor,
+ * Boston, MA 02110-1301, USA.
+ */
+
+/**
+ * SECTION:element-rtmp2serversrc
+ * @title: rtmp2serversrc
+ * @short_description: RTMP server source element
+ *
+ * rtmp2serversrc is a source element that listens for incoming RTMP
+ * connections on a configurable port. When a client connects and starts
+ * publishing, the element outputs the received audio/video data as FLV.
+ *
+ * ## Example launch lines
+ * |[
+ * gst-launch-1.0 rtmp2serversrc port=1935 ! filesink location=output.flv
+ * ]|
+ * Save incoming RTMP stream to file.
+ *
+ * |[
+ * gst-launch-1.0 rtmp2serversrc port=1935 ! flvdemux name=demux \
+ *   demux.video ! queue ! h264parse ! mpegtsmux name=mux ! srtsink uri="srt://:9000" \
+ *   demux.audio ! queue ! aacparse ! mux.
+ * ]|
+ * Re-stream RTMP to SRT.
+ *
+ * Since: 1.26
  */
 
 #ifdef HAVE_CONFIG_H
@@ -127,10 +161,10 @@ gst_rtmp2_server_src_class_init (GstRtmp2ServerSrcClass *klass)
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
   gst_element_class_set_static_metadata (gstelement_class,
-      "RTMP Server Source (Typed Pads)",
+      "RTMP2 Server Source",
       "Source/Network",
-      "RTMP server that emits video/audio on separate pads",
-      "Your Name <your.email@example.com>");
+      "Receive audio/video stream from an RTMP client",
+      "Yaron Torbaty <yaron.torbaty@gmail.com>");
 
   gst_element_class_add_static_pad_template (gstelement_class, &src_template);
   gst_element_class_add_static_pad_template (gstelement_class, &video_src_template);
