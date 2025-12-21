@@ -28,6 +28,7 @@
 #include "rtmp2chunk_v2.h"
 #include <string.h>
 #include <glib/gprintf.h>
+#include <netinet/tcp.h>  /* For TCP_NODELAY */
 
 /* Define our own debug category */
 GST_DEBUG_CATEGORY_STATIC (rtmp2_client_debug);
@@ -346,6 +347,11 @@ rtmp2_client_new (GSocketConnection * connection, GIOStream * io_stream)
     client->connection = g_object_ref (connection);
     client->socket = g_socket_connection_get_socket (connection);
     stream_to_use = G_IO_STREAM (connection);
+    
+    /* Enable TCP_NODELAY for immediate response delivery */
+    if (client->socket) {
+      g_socket_set_option (client->socket, IPPROTO_TCP, TCP_NODELAY, 1, NULL);
+    }
   } else {
     g_free (client);
     return NULL;
@@ -497,6 +503,12 @@ rtmp2_client_read_cb (GSocket * socket, GIOCondition condition, gpointer user_da
   gint read_attempts = 0;
   const gint max_reads = 100;  /* Drain up to 100 messages per callback */
 
+  /* If read thread is running, it handles all reading - remove this callback */
+  if (client->read_thread && client->thread_running) {
+    GST_DEBUG ("Read thread is active, removing GIO callback");
+    return G_SOURCE_REMOVE;
+  }
+
   /* Check if client is disconnected */
   if (client->state == RTMP2_CLIENT_STATE_DISCONNECTED ||
       client->state == RTMP2_CLIENT_STATE_ERROR) {
@@ -526,6 +538,28 @@ rtmp2_client_read_cb (GSocket * socket, GIOCondition condition, gpointer user_da
       /* No more data available right now - the 5ms timeout will retry */
       break;
     }
+    
+    /* Check if handshake signaled to start read thread */
+    if (client->need_read_thread) {
+      break;  /* Exit loop - we'll start the thread below */
+    }
+  }
+
+  /* After handshake completes, transition to dedicated read thread */
+  if (client->need_read_thread && !client->read_thread) {
+    client->need_read_thread = FALSE;  /* Clear flag */
+    client->thread_running = TRUE;
+    client->read_thread = g_thread_new ("rtmp-client-reader", 
+        client_read_thread_func, client);
+    
+    if (!client->read_thread) {
+      GST_WARNING ("Failed to create read thread");
+      client->state = RTMP2_CLIENT_STATE_ERROR;
+      return G_SOURCE_REMOVE;
+    }
+    
+    GST_INFO ("Started dedicated read thread - removing GIO callback");
+    return G_SOURCE_REMOVE;  /* Remove this callback, thread takes over */
   }
 
   /* Keep the source alive */
@@ -717,16 +751,22 @@ rtmp2_client_process_data (Rtmp2Client * client, GError ** error)
       }
       GST_DEBUG ("C0 processed successfully, version=0x%02x", buffer[0]);
     } else if (client->handshake.state == RTMP2_HANDSHAKE_STATE_C1) {
-      GST_DEBUG ("Reading C1 (%d bytes)", RTMP2_HANDSHAKE_SIZE);
+      /* Read remaining bytes needed for C1 into accumulator buffer */
+      gsize bytes_needed = RTMP2_HANDSHAKE_SIZE - client->handshake.read_buffer_len;
+      GST_DEBUG ("Reading C1: have %zu, need %zu more", 
+          client->handshake.read_buffer_len, bytes_needed);
+      
       if (G_IS_POLLABLE_INPUT_STREAM (client->input_stream)) {
         bytes_read = g_pollable_input_stream_read_nonblocking (
             G_POLLABLE_INPUT_STREAM (client->input_stream),
-            buffer, RTMP2_HANDSHAKE_SIZE, NULL, error);
+            client->handshake.read_buffer + client->handshake.read_buffer_len,
+            bytes_needed, NULL, error);
       } else {
-        bytes_read = g_input_stream_read (client->input_stream, buffer,
-            RTMP2_HANDSHAKE_SIZE, NULL, error);
+        bytes_read = g_input_stream_read (client->input_stream,
+            client->handshake.read_buffer + client->handshake.read_buffer_len,
+            bytes_needed, NULL, error);
       }
-      GST_DEBUG ("Read %zd bytes for C1 (expected %d)", bytes_read, RTMP2_HANDSHAKE_SIZE);
+      
       if (bytes_read < 0) {
         if (error && *error && g_error_matches (*error, G_IO_ERROR, G_IO_ERROR_WOULD_BLOCK)) {
           GST_DEBUG ("No data available for C1 (WOULD_BLOCK)");
@@ -741,15 +781,22 @@ rtmp2_client_process_data (Rtmp2Client * client, GError ** error)
         client->state = RTMP2_CLIENT_STATE_DISCONNECTED;
         return FALSE;
       }
-      if (bytes_read < RTMP2_HANDSHAKE_SIZE) {
-        GST_DEBUG ("Need more data for C1 (%zd < %d)", bytes_read, RTMP2_HANDSHAKE_SIZE);
-        return TRUE;
+      
+      client->handshake.read_buffer_len += bytes_read;
+      GST_DEBUG ("C1: accumulated %zu/%d bytes", client->handshake.read_buffer_len, RTMP2_HANDSHAKE_SIZE);
+      
+      if (client->handshake.read_buffer_len < RTMP2_HANDSHAKE_SIZE) {
+        return TRUE;  /* Need more data */
       }
-      if (!rtmp2_handshake_process_c1 (&client->handshake, buffer, bytes_read)) {
+      
+      /* Have full C1 - process it */
+      if (!rtmp2_handshake_process_c1 (&client->handshake, 
+          client->handshake.read_buffer, RTMP2_HANDSHAKE_SIZE)) {
         GST_WARNING ("Failed to process C1");
         client->state = RTMP2_CLIENT_STATE_ERROR;
         return FALSE;
       }
+      client->handshake.read_buffer_len = 0;  /* Reset for C2 */
       GST_DEBUG ("C1 processed successfully, sending S0/S1/S2");
       if (!rtmp2_client_send_handshake (client, error)) {
         GST_WARNING ("Failed to send handshake response: %s",
@@ -759,16 +806,22 @@ rtmp2_client_process_data (Rtmp2Client * client, GError ** error)
       }
       GST_DEBUG ("Handshake response (S0/S1/S2) sent successfully");
     } else if (client->handshake.state == RTMP2_HANDSHAKE_STATE_C2) {
-      GST_DEBUG ("Reading C2 (%d bytes)", RTMP2_HANDSHAKE_SIZE);
+      /* Read remaining bytes needed for C2 into accumulator buffer */
+      gsize bytes_needed = RTMP2_HANDSHAKE_SIZE - client->handshake.read_buffer_len;
+      GST_DEBUG ("Reading C2: have %zu, need %zu more", 
+          client->handshake.read_buffer_len, bytes_needed);
+      
       if (G_IS_POLLABLE_INPUT_STREAM (client->input_stream)) {
         bytes_read = g_pollable_input_stream_read_nonblocking (
             G_POLLABLE_INPUT_STREAM (client->input_stream),
-            buffer, RTMP2_HANDSHAKE_SIZE, NULL, error);
+            client->handshake.read_buffer + client->handshake.read_buffer_len,
+            bytes_needed, NULL, error);
       } else {
-        bytes_read = g_input_stream_read (client->input_stream, buffer,
-            RTMP2_HANDSHAKE_SIZE, NULL, error);
+        bytes_read = g_input_stream_read (client->input_stream,
+            client->handshake.read_buffer + client->handshake.read_buffer_len,
+            bytes_needed, NULL, error);
       }
-      GST_DEBUG ("Read %zd bytes for C2 (expected %d)", bytes_read, RTMP2_HANDSHAKE_SIZE);
+      
       if (bytes_read < 0) {
         if (error && *error && g_error_matches (*error, G_IO_ERROR, G_IO_ERROR_WOULD_BLOCK)) {
           GST_DEBUG ("No data available for C2 (WOULD_BLOCK)");
@@ -783,15 +836,22 @@ rtmp2_client_process_data (Rtmp2Client * client, GError ** error)
         client->state = RTMP2_CLIENT_STATE_DISCONNECTED;
         return FALSE;
       }
-      if (bytes_read < RTMP2_HANDSHAKE_SIZE) {
-        GST_DEBUG ("Need more data for C2 (%zd < %d)", bytes_read, RTMP2_HANDSHAKE_SIZE);
-        return TRUE;
+      
+      client->handshake.read_buffer_len += bytes_read;
+      GST_DEBUG ("C2: accumulated %zu/%d bytes", client->handshake.read_buffer_len, RTMP2_HANDSHAKE_SIZE);
+      
+      if (client->handshake.read_buffer_len < RTMP2_HANDSHAKE_SIZE) {
+        return TRUE;  /* Need more data */
       }
-      if (!rtmp2_handshake_process_c2 (&client->handshake, buffer, bytes_read)) {
+      
+      /* Have full C2 - process it */
+      if (!rtmp2_handshake_process_c2 (&client->handshake, 
+          client->handshake.read_buffer, RTMP2_HANDSHAKE_SIZE)) {
         GST_WARNING ("Failed to process C2");
         client->state = RTMP2_CLIENT_STATE_ERROR;
         return FALSE;
       }
+      client->handshake.read_buffer_len = 0;  /* Reset buffer */
       GST_DEBUG ("C2 processed successfully, handshake complete!");
       client->handshake_complete = TRUE;
       client->state = RTMP2_CLIENT_STATE_CONNECTING;
@@ -816,25 +876,21 @@ rtmp2_client_process_data (Rtmp2Client * client, GError ** error)
         GST_INFO ("Initialized chunk parser V2 with buffered stream");
       }
       
-      /* Start dedicated read thread */
-      /* Socket is now BLOCKING for V2 parser - reads will wait for complete data */
-      /* Thread uses synchronous blocking reads via ensure() */
-      client->thread_running = TRUE;
-      client->read_thread = g_thread_new ("rtmp-client-reader", 
-          client_read_thread_func, client);
-      
-      if (!client->read_thread) {
-        GST_WARNING ("Failed to create read thread");
-        client->state = RTMP2_CLIENT_STATE_ERROR;
-        return FALSE;
-      }
-      
-      GST_INFO ("Started dedicated read thread (non-blocking socket + polling)");
+      /* Signal that we need to start the read thread.
+       * The actual thread start happens in the GIO callback after this function returns,
+       * avoiding the race condition where both the callback and thread read simultaneously. */
+      client->need_read_thread = TRUE;
+      GST_INFO ("Handshake complete - signaling to start read thread on next callback exit");
     } else {
       GST_WARNING ("Unknown handshake state: %d", client->handshake.state);
     }
     return TRUE;
   }
+
+  /* NOTE: After handshake completes, the read thread handles all reading.
+   * The GIO callback (rtmp2_client_read_cb) should not call this function
+   * anymore once the read thread is running. This check is a safety guard
+   * but the real fix is in rtmp2_client_read_cb to check thread_running. */
 
   /* Read RTMP chunks with V2 parser */
   GST_DEBUG ("Reading RTMP message with V2 parser (handshake complete)");
@@ -987,6 +1043,10 @@ rtmp2_client_process_data (Rtmp2Client * client, GError ** error)
                     } else {
                       GST_INFO ("releaseStream result sent successfully");
                     }
+                    /* Flush after releaseStream */
+                    if (G_IS_OUTPUT_STREAM (client->output_stream)) {
+                      g_output_stream_flush (client->output_stream, NULL, NULL);
+                    }
                     g_free (stream_name);
                   } else if (g_strcmp0 (cmd_name, "FCPublish") == 0) {
                     Rtmp2AmfValue value;
@@ -1014,19 +1074,8 @@ rtmp2_client_process_data (Rtmp2Client * client, GError ** error)
                       client->stream_key = g_strdup (stream_name);
                     }
 
-                    GST_INFO ("Sending FCPublish responses");
-                    if (!rtmp2_client_send_on_fc_publish (client, stream_name,
-                            error)) {
-                      GST_WARNING ("Failed to send onFCPublish");
-                    } else {
-                      GST_INFO ("onFCPublish sent successfully");
-                    }
-                    if (!rtmp2_client_send_release_stream_result (client,
-                            transaction_id, error)) {
-                      GST_WARNING ("Failed to ack FCPublish");
-                    } else {
-                      GST_INFO ("FCPublish ack sent successfully");
-                    }
+                    /* Skip onFCPublish - FFmpeg doesn't require it and it can cause issues */
+                    GST_INFO ("FCPublish acknowledged (skipping onFCPublish response)");
 
                     if (stream_name)
                       g_free (stream_name);
@@ -1112,54 +1161,34 @@ rtmp2_client_process_data (Rtmp2Client * client, GError ** error)
           /* We need to reconstruct the full FLV tag for downstream elements */
           
           GstBuffer *flv_tag_buffer = gst_buffer_new_allocate (NULL, 11 + msg->message_length + 4, NULL);
-          GstMapInfo tag_map, msg_map;
+          GstMapInfo msg_map;
           
-          if (gst_buffer_map (flv_tag_buffer, &tag_map, GST_MAP_WRITE) &&
-              gst_buffer_map (msg->buffer, &msg_map, GST_MAP_READ)) {
+          /* Store just the raw RTMP message data (no FLV wrapper) for typed pads output */
+          if (gst_buffer_map (msg->buffer, &msg_map, GST_MAP_READ)) {
+            /* Parse video/audio codec info from first byte */
+            guint8 codec_info = msg_map.size > 0 ? msg_map.data[0] : 0;
             
-            guint8 *ptr = tag_map.data;
-            
-            /* FLV tag header (11 bytes) */
-            *ptr++ = msg->message_type; /* Tag type: 8=audio, 9=video */
-            
-            /* Data size (24-bit big-endian) */
-            *ptr++ = (msg->message_length >> 16) & 0xff;
-            *ptr++ = (msg->message_length >> 8) & 0xff;
-            *ptr++ = msg->message_length & 0xff;
-            
-            /* Timestamp (24-bit big-endian) + extended timestamp */
-            guint32 ts = msg->timestamp;
-            *ptr++ = (ts >> 16) & 0xff;
-            *ptr++ = (ts >> 8) & 0xff;
-            *ptr++ = ts & 0xff;
-            *ptr++ = (ts >> 24) & 0xff; /* Extended timestamp */
-            
-            /* Stream ID (24-bit, always 0) */
-            *ptr++ = 0;
-            *ptr++ = 0;
-            *ptr++ = 0;
-            
-            /* Copy tag body data */
-            memcpy (ptr, msg_map.data, msg->message_length);
-            ptr += msg->message_length;
-            
-            /* Previous tag size (32-bit big-endian) */
-            guint32 prev_tag_size = 11 + msg->message_length;
-            *ptr++ = (prev_tag_size >> 24) & 0xff;
-            *ptr++ = (prev_tag_size >> 16) & 0xff;
-            *ptr++ = (prev_tag_size >> 8) & 0xff;
-            *ptr++ = prev_tag_size & 0xff;
-            
-            gst_buffer_unmap (msg->buffer, &msg_map);
-            gst_buffer_unmap (flv_tag_buffer, &tag_map);
-            
-            /* Create FLV tag wrapper and add to pending */
+            /* Create FLV tag wrapper with raw data */
             Rtmp2FlvTag *tag = g_new0 (Rtmp2FlvTag, 1);
             tag->tag_type = msg->message_type == RTMP2_MESSAGE_VIDEO ? 
                 RTMP2_FLV_TAG_VIDEO : RTMP2_FLV_TAG_AUDIO;
             tag->timestamp = msg->timestamp;
-            tag->data_size = 11 + msg->message_length + 4;
-            tag->data = flv_tag_buffer; /* Transfer ownership */
+            tag->data_size = msg->message_length;
+            
+            /* For video: extract codec and keyframe info */
+            if (msg->message_type == RTMP2_MESSAGE_VIDEO) {
+              tag->video_codec = (Rtmp2FlvVideoCodec) (codec_info & 0x0f);
+              tag->video_keyframe = ((codec_info >> 4) & 0x0f) == 1;
+            } else {
+              tag->audio_codec = (Rtmp2FlvAudioCodec) ((codec_info >> 4) & 0x0f);
+            }
+            
+            /* Copy the FULL message data INCLUDING first byte (codec info) */
+            /* We need the full byte for proper FLV reconstruction */
+            tag->data = gst_buffer_copy (msg->buffer);
+            
+            gst_buffer_unmap (msg->buffer, &msg_map);
+            gst_buffer_unref (flv_tag_buffer); /* Don't need this anymore */
             
             g_mutex_lock (&client->flv_parser.pending_tags_lock);
             client->flv_parser.pending_tags = 

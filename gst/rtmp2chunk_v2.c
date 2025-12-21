@@ -521,15 +521,24 @@ rtmp2_chunk_parser_v2_read_message (Rtmp2ChunkParserV2 *parser,
       }
     } else {
       msg->chunk_type = chunk_type;
-      /* Type 3 - ensure we have a valid message to continue */
-      if (!msg->buffer || msg->message_length == 0) {
+      /* Type 3 - continuation chunk that reuses previous header */
+      if (msg->message_length == 0) {
+        /* No previous message to continue from */
         parser->diagnostics.continuations_without_state++;
         parser->diagnostics.dropped_chunks++;
-        GST_WARNING ("Type 3 continuation but no valid message in progress (csid=%d) - dropping chunk",
+        GST_WARNING ("Type 3 continuation but no previous message header (csid=%d) - dropping chunk",
             chunk_stream_id);
         g_set_error (error, GST_CORE_ERROR, GST_CORE_ERROR_FAILED,
             "Type 3 continuation without an in-flight message (csid=%d)", chunk_stream_id);
         return FALSE;
+      }
+      
+      /* If buffer is NULL but we have message_length, this is a NEW message reusing previous header */
+      if (!msg->buffer && msg->bytes_received == 0) {
+        GST_DEBUG ("Type 3 starting new message on csid=%d, reusing previous header (length=%u, type=%u)",
+            chunk_stream_id, msg->message_length, msg->message_type);
+        msg->buffer = gst_buffer_new_allocate (NULL, msg->message_length, NULL);
+        msg->complete = FALSE;
       }
     }
     

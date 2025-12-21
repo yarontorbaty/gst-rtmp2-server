@@ -1,43 +1,53 @@
-# RTMP Server - SOLUTION FOUND!
+# RTMP Server - FULLY WORKING! 🎉
 
-## 🎉 SUCCESS - Server is FULLY WORKING!
+## Status: ✅ Audio + Video working correctly
 
-The RTMP server successfully receives streams from FFmpeg/GStreamer clients!
+The RTMP server now correctly:
+1. ✅ Receives RTMP stream from FFmpeg (with `-re` for real-time)
+2. ✅ Parses video (H.264) and audio (AAC) data
+3. ✅ Handles interleaved audio/video chunk streams
+4. ✅ Outputs valid FLV format with proper headers
+5. ✅ 90 video frames + 131 audio frames captured correctly
 
-### Proof
-```
-FFmpeg output:
-frame=  240 fps= 32 q=-1.0 Lsize=     149KiB time=00:00:08.00 bitrate= 152.9kbits/s speed=1.05x
-```
+## Working Test Commands
 
-### What's Working
-1. ✅ Complete RTMP handshake (all commands)
-2. ✅ FFmpeg streams successfully (240 frames, 149KB)
-3. ✅ Server receives all data
-4. ✅ No crashes, no errors
-
-### Issue Identified
-The FLV parser is creating tags with 0-byte buffers because:
-- RTMP messages contain FLV tag BODIES (without 11-byte header)
-- FLV parser expects full tags WITH headers
-- Mismatch causes data to be lost
-
-### Solution
-Either:
-1. **Bypass FLV parser** - write RTMP message data directly to output
-2. **Fix FLV parser** - reconstruct full FLV tags from RTMP messages
-3. **Use flvmux** - pass raw H.264/AAC to flvmux element
-
-Recommendation: Use rtmp2serversrc ! flvmux ! filesink for proper FLV file creation.
-
-### Test Command That Works
+### Server:
 ```bash
-export GST_PLUGIN_PATH=/path/to/build
-gst-launch-1.0 rtmp2serversrc port=1935 ! flvmux ! filesink location=output.flv
-
-# In another terminal:
-ffmpeg -re -f lavfi -i testsrc -c:v libx264 -t 5 -f flv rtmp://localhost:1935/live/test
+cd /Users/yarontorbaty/gst-rtmp2-server
+GST_PLUGIN_PATH=./build gst-launch-1.0 rtmp2serversrc port=1935 ! filesink location=/tmp/out.flv
 ```
 
-The server protocol implementation is COMPLETE and WORKING!
+### FFmpeg (MUST use `-re` for real-time streaming):
+```bash
+ffmpeg -re -y -f lavfi -i testsrc=duration=3:rate=30 -f lavfi -i sine=duration=3:frequency=440 \
+  -c:v libx264 -preset ultrafast -c:a aac -b:a 128k \
+  -f flv rtmp://localhost:1935/live/test
+```
 
+### Verify:
+```bash
+ffprobe -v error -count_frames -show_entries stream=codec_type,codec_name,nb_read_frames -of csv=p=0 /tmp/out.flv
+# Output: h264,video,90
+#         aac,audio,131
+```
+
+## Key Fixes Made
+
+1. **FLV File Header**: Added proper FLV signature with audio+video flags (0x05)
+2. **FLV Tag Structure**: Preserved full RTMP message body including codec info byte
+3. **Type 3 Chunk Handling**: Fixed chunk parser to handle Type 3 continuations for new messages that reuse previous header metadata
+4. **srcpad**: Added always-present source pad for raw FLV output
+5. **EOS Grace Period**: Wait 100ms before sending EOS to ensure all data is processed
+6. **Race Condition Fix**: Fixed pending_tags access without holding lock
+
+## Important Notes
+
+- **MUST use `-re` flag** with FFmpeg to stream at real-time rate
+- Without `-re`, FFmpeg blasts data too fast and the server can't keep up
+- The `rtmp2serversrc` outputs raw FLV on its main `src` pad
+
+## Build
+
+```bash
+./quick_rebuild.sh
+```

@@ -67,6 +67,7 @@ typedef struct _Rtmp2Client {
       gboolean handshake_complete;
       gboolean connect_received;
       gboolean publish_received;
+      gboolean need_read_thread;  /* Signal to start read thread after callback exits */
   
   /* Enhanced RTMP support */
   Rtmp2EnhancedCapabilities *client_caps;

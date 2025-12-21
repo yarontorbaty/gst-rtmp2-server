@@ -42,6 +42,9 @@ typedef struct {
   guint8 s2[RTMP2_HANDSHAKE_SIZE];
   guint32 timestamp;
   guint32 random[4];
+  /* Accumulator for partial reads during handshake */
+  guint8 read_buffer[RTMP2_HANDSHAKE_SIZE];
+  gsize read_buffer_len;
 } Rtmp2Handshake;
 
 void rtmp2_handshake_init (Rtmp2Handshake *handshake);

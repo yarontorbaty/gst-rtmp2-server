@@ -22,7 +22,6 @@
 #define __GST_RTMP2_SERVER_H__
 
 #include <gst/gst.h>
-#include <gst/base/gstpushsrc.h>
 #include <gio/gio.h>
 
 G_BEGIN_DECLS
@@ -48,7 +47,7 @@ typedef struct _Rtmp2Client Rtmp2Client;
 #include "rtmp2flv.h"
 
 struct _GstRtmp2ServerSrc {
-  GstPushSrc parent;
+  GstElement parent;
 
   /* Properties */
   gchar *host;
@@ -73,18 +72,30 @@ struct _GstRtmp2ServerSrc {
 
   /* Current active client */
   Rtmp2Client *active_client;
+  
+  /* Source pad (always present - outputs raw FLV data) */
   GstPad *srcpad;
+  gboolean srcpad_started;  /* TRUE after stream-start sent */
+  gint64 eos_wait_start;    /* Monotonic time when queue became empty for EOS check */
+  
+  /* Stream pads (sometimes pads - created on first video/audio message) */
+  GstPad *video_pad;
+  GstPad *audio_pad;
+  GMutex pad_lock;
+  GstTask *task;
+  GRecMutex task_lock;
   
   /* Stream info */
   gboolean have_video;
   gboolean have_audio;
   GstCaps *video_caps;
   GstCaps *audio_caps;
-  gboolean sent_flv_header;
+  GstBuffer *video_codec_data;
+  GstBuffer *audio_codec_data;
 };
 
 struct _GstRtmp2ServerSrcClass {
-  GstPushSrcClass parent_class;
+  GstElementClass parent_class;
 };
 
 GType gst_rtmp2_server_src_get_type (void);
