@@ -419,8 +419,22 @@ client_read_thread_func (gpointer user_data)
     /* This handles incomplete chunks by reading more data */
     while (read_attempts++ < max_attempts && !processed) {
       
-      /* Wait for data with 50ms timeout using g_socket_condition_timed_wait */
-      if (client->socket) {
+      /* CRITICAL FIX: Check if there's already data in the fast buffer!
+       * After reading a batch of data from socket, we may have multiple RTMP
+       * messages buffered. Process them all before waiting for more socket data.
+       */
+      gboolean has_buffered_data = FALSE;
+      if (client->chunk_parser.buffer) {
+        gsize available = rtmp2_fast_buffer_available (client->chunk_parser.buffer);
+        if (available > 0) {
+          has_buffered_data = TRUE;
+          GST_DEBUG ("Fast buffer has %zu bytes available, processing without socket wait", 
+              available);
+        }
+      }
+      
+      /* Only wait for socket data if no buffered data */
+      if (!has_buffered_data && client->socket) {
         GError *wait_error = NULL;
         gint64 timeout_us = 50000;  /* 50ms in microseconds */
         gboolean ready = g_socket_condition_timed_wait (client->socket, G_IO_IN,
