@@ -1,5 +1,5 @@
 /* GStreamer RTMP2 Server - Client Handler
- * Copyright (C) 2024 Yaron Torbaty <yaron.torbaty@gmail.com>
+ * Copyright (C) 2025 Yaron Torbaty <yarontorbaty@gmail.com>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Library General Public
@@ -46,15 +46,6 @@ write_uint8 (GByteArray * ba, guint8 val)
 {
   g_byte_array_append (ba, &val, 1);
 }
-
-/* static void */
-/* write_uint16_be (GByteArray * ba, guint16 val) */
-/* { */
-/*   guint8 data[2]; */
-/*   data[0] = (val >> 8) & 0xff; */
-/*   data[1] = val & 0xff; */
-/*   g_byte_array_append (ba, data, 2); */
-/* } */
 
 static void
 write_uint24_be (GByteArray * ba, guint32 val)

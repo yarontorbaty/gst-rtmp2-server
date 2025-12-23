@@ -1,6 +1,6 @@
 /*
  * GStreamer
- * Copyright (C) 2024 Yaron Torbaty <yaron.torbaty@gmail.com>
+ * Copyright (C) 2025 Yaron Torbaty <yarontorbaty@gmail.com>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Library General Public
@@ -46,25 +46,6 @@ rtmp2_enhanced_capabilities_free (Rtmp2EnhancedCapabilities * caps)
 
   g_free (caps);
 }
-
-/* static gboolean */
-/* parse_video_fourcc_info_map (const guint8 ** data, gsize * size, */
-/*     GHashTable * map, GError ** error) */
-/* { */
-/*   Rtmp2AmfValue value; */
-
-/*   if (!rtmp2_amf0_parse (data, size, &value, error)) */
-/*     return FALSE; */
-
-/*   if (value.amf0_type != RTMP2_AMF0_ECMA_ARRAY) { */
-/*     rtmp2_amf_value_free (&value); */
-/*     return FALSE; */
-/*   } */
-
-/*   /\* Simplified - full implementation would parse ECMA array *\/ */
-/*   rtmp2_amf_value_free (&value); */
-/*   return TRUE; */
-/* } */
 
 gboolean
 rtmp2_enhanced_parse_connect (const guint8 * data, gsize size,

@@ -34,36 +34,31 @@ cdata.set_quoted('GST_PACKAGE_ORIGIN', 'https://github.com/gstreamer/gst-plugins
 
 configure_file(output : 'config.h', configuration : cdata)
 
+# Shared RTMP library (from GStreamer gst-plugins-bad/gst/rtmp2/rtmp/)
+rtmp_lib_sources = [
+  'gst/rtmp/amf.c',
+  'gst/rtmp/rtmpchunkstream.c',
+  'gst/rtmp/rtmpclient.c',
+  'gst/rtmp/rtmpconnection.c',
+  'gst/rtmp/rtmphandshake.c',
+  'gst/rtmp/rtmpmessage.c',
+  'gst/rtmp/rtmputils.c',
+  # New server-specific additions
+  'gst/rtmp/rtmpserver.c',
+  'gst/rtmp/rtmpflv.c',
+]
+
+# Plugin sources
 gst_rtmp2_server_sources = [
   'gst/gstrtmp2serversrc.c',
   'gst/gstrtmp2server.c',
-  'gst/rtmp2handshake.c',
-  'gst/rtmp2chunk.c',
-  'gst/rtmp2chunk_v2.c',
-  'gst/rtmp2flv.c',
-  'gst/rtmp2client.c',
-  'gst/rtmp2amf.c',
-  'gst/rtmp2enhanced.c',
-]
-
-gst_rtmp2_server_headers = [
-  'gst/gstrtmp2serversrc.h',
-  'gst/gstrtmp2server.h',
-  'gst/rtmp2handshake.h',
-  'gst/rtmp2chunk.h',
-  'gst/rtmp2chunk_v2.h',
-  'gst/rtmp2flv.h',
-  'gst/rtmp2client.h',
-  'gst/rtmp2amf.h',
-  'gst/rtmp2enhanced.h',
 ]
 
 gst_rtmp2_server = library('gstrtmp2server',
-  gst_rtmp2_server_sources,
-  include_directories : include_directories('.'),
+  gst_rtmp2_server_sources + rtmp_lib_sources,
+  include_directories : include_directories('.', 'gst'),
   c_args : ['-DHAVE_CONFIG_H'],
   dependencies : [gst_dep, gstbase_dep, gstapp_dep, gstvideo_dep, gstaudio_dep, glib_dep, gio_dep],
   install : true,
   install_dir : plugin_install_dir,
 )
-

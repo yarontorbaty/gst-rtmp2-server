@@ -14,7 +14,7 @@ if [ -z "$CFLAGS" ]; then
   exit 1
 fi
 
-# Compile all source files
+# Compile all source files (using old structure for now)
 for src in rtmp2chunk_v2.c gstrtmp2serversrc.c rtmp2client.c rtmp2chunk.c rtmp2amf.c rtmp2handshake.c rtmp2flv.c rtmp2enhanced.c gstrtmp2server.c; do
   if [ -f "../gst/$src" ]; then
     echo "Compiling $src..."

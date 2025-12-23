@@ -1,6 +1,6 @@
 /*
  * GStreamer
- * Copyright (C) 2024 Yaron Torbaty <yaron.torbaty@gmail.com>
+ * Copyright (C) 2025 Yaron Torbaty <yarontorbaty@gmail.com>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Library General Public
