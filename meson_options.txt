@@ -1,2 +1,0 @@
-option('examples', type : 'boolean', value : true, description : 'Build example applications')
-
