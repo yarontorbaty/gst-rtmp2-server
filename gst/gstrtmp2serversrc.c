@@ -671,22 +671,68 @@ push_video_buffer (GstRtmp2ServerSrc *src, Rtmp2FlvTag *tag)
       map.size > 3 ? map.data[3] : 0,
       map.size > 4 ? map.data[4] : 0);
   
-  /* data[0] = codec info, data[1] = AVC packet type (0=seq header, 1=NALU, 2=end) */
+  /* Check for enhanced RTMP (HEVC/AV1) - first byte >= 0x80 */
+  gboolean is_enhanced = (map.data[0] & 0x80) != 0;
+  gsize header_size = 5;  /* Default: AVC header size */
+  gint32 composition_time_ms = 0;  /* Composition time offset for B-frames */
+  
+  if (is_enhanced) {
+    /* Enhanced RTMP format: [frame_type_and_packet_type][fourcc:4bytes][data]
+     * For HEVC: fourcc = "hvc1", data starts at offset 5 for coded frames
+     * For coded frames (packet_type=1), there's also 3 bytes composition time */
+    guint8 packet_type = map.data[0] & 0x0F;
+    gboolean is_hevc = (map.size >= 5 && 
+                        map.data[1] == 'h' && map.data[2] == 'v' && 
+                        map.data[3] == 'c' && map.data[4] == '1');
+    
+    if (is_hevc && packet_type == 1) {
+      /* Coded frames - skip 5 byte header + 3 byte composition time */
+      header_size = 8;
+      /* Extract composition time (signed 24-bit BE) */
+      if (map.size >= 8) {
+        composition_time_ms = (map.data[5] << 16) | (map.data[6] << 8) | map.data[7];
+        if (composition_time_ms & 0x800000)  /* Sign extend */
+          composition_time_ms |= 0xFF000000;
+      }
+      GST_DEBUG_OBJECT (src, "HEVC coded frame detected, cts=%d", composition_time_ms);
+    } else if (is_hevc && packet_type == 0) {
+      /* Sequence header - skip for now */
+      gst_buffer_unmap (tag->data, &map);
+      GST_DEBUG_OBJECT (src, "HEVC sequence header - skipping");
+      return GST_FLOW_OK;
+    } else {
+      gst_buffer_unmap (tag->data, &map);
+      GST_DEBUG_OBJECT (src, "Enhanced RTMP: unknown packet type %d or codec", packet_type);
+      return GST_FLOW_OK;
+    }
+  } else {
+    /* Standard AVC format: data[0] = codec info, data[1] = AVC packet type, data[2-4] = CTS */
   if (map.size < 6 || map.data[1] != 0x01) {  /* 0x01 = AVC NALU */
     gst_buffer_unmap (tag->data, &map);
     GST_DEBUG_OBJECT (src, "Skipping: not AVC NALU (packet type = 0x%02x)", 
         map.size > 1 ? map.data[1] : 0);
     return GST_FLOW_OK;
+    }
+    /* Extract composition time offset (signed 24-bit big-endian) */
+    composition_time_ms = (map.data[2] << 16) | (map.data[3] << 8) | map.data[4];
+    if (composition_time_ms & 0x800000)  /* Sign extend for negative values */
+      composition_time_ms |= 0xFF000000;
   }
   gst_buffer_unmap (tag->data, &map);
   
-  /* Create buffer (skip first 5 bytes: codec_info + packet type + composition time) */
-  buffer = gst_buffer_copy_region (tag->data, GST_BUFFER_COPY_ALL, 5,
-      gst_buffer_get_size (tag->data) - 5);
+  /* Create buffer (skip header bytes) */
+  if (gst_buffer_get_size (tag->data) <= header_size) {
+    GST_DEBUG_OBJECT (src, "Video tag too small for payload");
+    return GST_FLOW_OK;
+  }
+  buffer = gst_buffer_copy_region (tag->data, GST_BUFFER_COPY_ALL, header_size,
+      gst_buffer_get_size (tag->data) - header_size);
   
-  /* Set timestamp */
-  GST_BUFFER_PTS (buffer) = tag->timestamp * GST_MSECOND;
-  GST_BUFFER_DTS (buffer) = GST_BUFFER_PTS (buffer);
+  /* Set timestamps: DTS = tag timestamp, PTS = DTS + composition time */
+  GstClockTime dts = tag->timestamp * GST_MSECOND;
+  GstClockTime pts = dts + (composition_time_ms * GST_MSECOND);
+  GST_BUFFER_DTS (buffer) = dts;
+  GST_BUFFER_PTS (buffer) = pts;
   
   if (tag->video_keyframe)
     GST_BUFFER_FLAG_UNSET (buffer, GST_BUFFER_FLAG_DELTA_UNIT);
@@ -821,11 +867,72 @@ server_accept_cb (GSocket *socket, GIOCondition condition, gpointer user_data)
   /* Store client reference */
   g_mutex_lock (&src->clients_lock);
   src->clients = g_list_append (src->clients, client);
+  gboolean need_stream_reset = FALSE;
   if (!src->active_client) {
     src->active_client = client;
-    GST_INFO_OBJECT (src, "New active client connected");
+    /* Check if this is a reconnection (pads already exist) */
+    g_mutex_lock (&src->pad_lock);
+    need_stream_reset = (src->video_pad != NULL || src->audio_pad != NULL);
+    g_mutex_unlock (&src->pad_lock);
+    GST_INFO_OBJECT (src, "New active client connected%s", 
+        need_stream_reset ? " (reconnection - will reset stream)" : "");
   }
   g_mutex_unlock (&src->clients_lock);
+  
+  /* For reconnection: send new stream-start, caps, and segment events */
+  if (need_stream_reset) {
+    g_mutex_lock (&src->pad_lock);
+    if (src->video_pad) {
+      gchar *stream_id = gst_pad_create_stream_id (src->video_pad, GST_ELEMENT (src), "video");
+      gst_pad_push_event (src->video_pad, gst_event_new_stream_start (stream_id));
+      g_free (stream_id);
+      
+      /* Re-send caps */
+      GstCaps *caps = gst_caps_new_simple ("video/x-h264",
+          "stream-format", G_TYPE_STRING, "avc",
+          "alignment", G_TYPE_STRING, "au",
+          NULL);
+      if (src->video_codec_data) {
+        gst_caps_set_simple (caps, "codec_data", GST_TYPE_BUFFER, src->video_codec_data, NULL);
+      }
+      gst_pad_push_event (src->video_pad, gst_event_new_caps (caps));
+      gst_caps_unref (caps);
+      
+      /* Re-send segment */
+      GstSegment segment;
+      gst_segment_init (&segment, GST_FORMAT_TIME);
+      gst_pad_push_event (src->video_pad, gst_event_new_segment (&segment));
+      
+      GST_INFO_OBJECT (src, "Sent stream reset events on video pad");
+    }
+    if (src->audio_pad) {
+      gchar *stream_id = gst_pad_create_stream_id (src->audio_pad, GST_ELEMENT (src), "audio");
+      gst_pad_push_event (src->audio_pad, gst_event_new_stream_start (stream_id));
+      g_free (stream_id);
+      
+      /* Re-send caps */
+      GstCaps *caps = gst_caps_new_simple ("audio/mpeg",
+          "mpegversion", G_TYPE_INT, 4,
+          "stream-format", G_TYPE_STRING, "raw",
+          NULL);
+      if (src->audio_codec_data) {
+        gst_caps_set_simple (caps, "codec_data", GST_TYPE_BUFFER, src->audio_codec_data, NULL);
+      }
+      gst_pad_push_event (src->audio_pad, gst_event_new_caps (caps));
+      gst_caps_unref (caps);
+      
+      /* Re-send segment */
+      GstSegment segment;
+      gst_segment_init (&segment, GST_FORMAT_TIME);
+      gst_pad_push_event (src->audio_pad, gst_event_new_segment (&segment));
+      
+      GST_INFO_OBJECT (src, "Sent stream reset events on audio pad");
+    }
+    g_mutex_unlock (&src->pad_lock);
+    
+    /* Reset EOS wait timer */
+    src->eos_wait_start = 0;
+  }
 
   /* Start async reading - this triggers handshake */
   if (!rtmp2_client_start_reading (client, src->context)) {
@@ -912,11 +1019,37 @@ gst_rtmp2_server_src_loop (gpointer user_data)
       
       GST_INFO_OBJECT (src, "Publishing client disconnected with no remaining tags after grace period, sending EOS");
       src->eos_wait_start = 0;  /* Reset for next time */
-      gst_pad_push_event (src->srcpad, gst_event_new_eos ());
+      
+      /* CRITICAL FIX Issue #102: Post pre-EOS message FIRST
+       * This allows the source worker to stop appsink access before destruction
+       * The bus sync handler will immediately set pipeline_shutting_down_ flag */
+      {
+        GstStructure *s = gst_structure_new ("rtmp2server-pre-eos",
+            "reason", G_TYPE_STRING, "client-disconnected", NULL);
+        gst_element_post_message (GST_ELEMENT (src),
+            gst_message_new_element (GST_OBJECT (src), s));
+        GST_INFO_OBJECT (src, "Posted pre-EOS message to bus");
+      }
+      
+      /* Long delay to allow source worker to process pre-EOS and stop appsink access
+       * CRITICAL: The source worker polls the bus every ~10ms, but process_frame() might
+       * be in the middle of a video/audio processing cycle. 500ms should be enough. */
+      g_usleep (500000);  /* 500ms */
+      
+      /* Now post actual EOS to bus */
+      gst_element_post_message (GST_ELEMENT (src),
+          gst_message_new_eos (GST_OBJECT (src)));
+      GST_INFO_OBJECT (src, "Posted EOS message to bus, now pushing EOS events to pads");
+      
+      /* Push EOS events to pads - this signals downstream elements that the stream has ended
+       * Do this AFTER posting the bus message so the source worker can prepare */
       if (src->video_pad)
         gst_pad_push_event (src->video_pad, gst_event_new_eos ());
       if (src->audio_pad)
         gst_pad_push_event (src->audio_pad, gst_event_new_eos ());
+      gst_pad_push_event (src->srcpad, gst_event_new_eos ());
+      
+      GST_INFO_OBJECT (src, "All EOS events pushed, pausing task");
       gst_task_pause (src->task);
     } else {
       src->eos_wait_start = 0;  /* Reset if we're still waiting for more */
@@ -931,20 +1064,31 @@ gst_rtmp2_server_src_loop (gpointer user_data)
   /* Route tag to appropriate pad */
   GST_INFO_OBJECT (src, "Loop: dequeued tag type=%d ts=%u", tag->tag_type, tag->timestamp);
   
-  /* Always push to srcpad (raw FLV output) */
-  ret = push_to_srcpad (src, tag);
-  
-  /* Also push to typed pads if someone is listening */
+  /* Push to typed pads first - these create pads dynamically if needed */
+  GstFlowReturn typed_ret = GST_FLOW_OK;
   if (tag->tag_type == RTMP2_FLV_TAG_VIDEO) {
-    push_video_buffer (src, tag);
+    typed_ret = push_video_buffer (src, tag);
   } else if (tag->tag_type == RTMP2_FLV_TAG_AUDIO) {
-    push_audio_buffer (src, tag);
+    typed_ret = push_audio_buffer (src, tag);
   }
+  
+  /* Also push to srcpad (raw FLV output) - but don't fail if not linked */
+  ret = push_to_srcpad (src, tag);
   
   rtmp2_flv_tag_free (tag);
   
-  /* Handle flow errors */
-  if (ret != GST_FLOW_OK && ret != GST_FLOW_FLUSHING) {
+  /* Handle flow errors - srcpad NOT_LINKED is OK if typed pads are working */
+  if (ret == GST_FLOW_NOT_LINKED && typed_ret == GST_FLOW_OK) {
+    /* srcpad not connected but typed pads are working - this is fine */
+    return;
+  }
+  
+  /* Use typed pad result if srcpad wasn't linked */
+  if (ret == GST_FLOW_NOT_LINKED) {
+    ret = typed_ret;
+  }
+  
+  if (ret != GST_FLOW_OK && ret != GST_FLOW_FLUSHING && ret != GST_FLOW_NOT_LINKED) {
     GST_ERROR_OBJECT (src, "Flow error: %s, pausing task", gst_flow_get_name (ret));
     gst_task_pause (src->task);
   }
@@ -966,8 +1110,9 @@ gst_rtmp2_server_src_change_state (GstElement *element, GstStateChange transitio
       
       GST_INFO_OBJECT (src, "NULL→READY: Starting server on %s:%u", src->host, src->port);
 
-      /* Use default main context */
-  src->context = g_main_context_default ();
+      /* Create dedicated main context for RTMP server
+       * Using default context can conflict with GStreamer's main loop */
+  src->context = g_main_context_new ();
 
       /* Create socket */
   src->server_socket = g_socket_new (G_SOCKET_FAMILY_IPV4,
@@ -980,6 +1125,12 @@ gst_rtmp2_server_src_change_state (GstElement *element, GstStateChange transitio
   }
 
   g_socket_set_blocking (src->server_socket, FALSE);
+  
+  /* Enable SO_REUSEADDR and SO_REUSEPORT for fast rebinding after disconnect */
+  g_socket_set_option (src->server_socket, SOL_SOCKET, SO_REUSEADDR, 1, NULL);
+#ifdef SO_REUSEPORT
+  g_socket_set_option (src->server_socket, SOL_SOCKET, SO_REUSEPORT, 1, NULL);
+#endif
 
       /* Bind to address */
   inet_address = g_inet_address_new_from_string (src->host);
@@ -1068,26 +1219,53 @@ gst_rtmp2_server_src_change_state (GstElement *element, GstStateChange transitio
 
       GST_INFO_OBJECT (src, "READY→NULL: Cleaning up");
       
-      /* Stop event loop */
-  if (src->event_thread) {
+      /* CRITICAL: Proper shutdown order to avoid "Bad file descriptor" poll errors:
+       * 1. Signal event loop to stop (sets running=FALSE)
+       * 2. Wakeup context so thread exits its iteration
+       * 3. Join thread (will exit since running=FALSE)
+       * 4. THEN cleanup sources and sockets
+       */
+      
+      /* Step 1: Signal thread to stop */
     src->running = FALSE;
-        if (src->context)
+      
+      /* Step 2: Wakeup context to unblock g_main_context_iteration */
+      if (src->context) {
       g_main_context_wakeup (src->context);
+      }
+      
+      /* Step 3: Wait for event thread to exit */
+      if (src->event_thread) {
     g_thread_join (src->event_thread);
     src->event_thread = NULL;
+        GST_DEBUG_OBJECT (src, "Event thread joined");
   }
 
-      /* Cleanup server source */
+      /* Step 4: Now safe to cleanup server source */
   if (src->server_source) {
     g_source_destroy (src->server_source);
     g_source_unref (src->server_source);
     src->server_source = NULL;
+        GST_DEBUG_OBJECT (src, "Server source destroyed");
   }
 
-      /* Cleanup server socket */
+      /* Step 5: Close and cleanup server socket */
   if (src->server_socket) {
+        GError *close_error = NULL;
+        if (!g_socket_close (src->server_socket, &close_error)) {
+          GST_WARNING_OBJECT (src, "Error closing server socket: %s", 
+              close_error ? close_error->message : "unknown");
+          g_clear_error (&close_error);
+        }
     g_object_unref (src->server_socket);
     src->server_socket = NULL;
+        GST_INFO_OBJECT (src, "Server socket closed and released");
+      }
+  
+      /* Step 6: Free dedicated context */
+      if (src->context) {
+        g_main_context_unref (src->context);
+        src->context = NULL;
   }
 
       /* Cleanup clients */
