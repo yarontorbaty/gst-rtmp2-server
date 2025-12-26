@@ -503,6 +503,20 @@ gst_rtmp2_server_src_loop (gpointer user_data)
         return;
       }
 
+      /* Post pre-EOS message first to allow consumers to prepare for shutdown.
+       * This is critical for applications that need to stop accessing the
+       * element before destruction. */
+      {
+        GstStructure *s = gst_structure_new ("rtmp2server-pre-eos",
+            "reason", G_TYPE_STRING, "client-disconnected", NULL);
+        gst_element_post_message (GST_ELEMENT (src),
+            gst_message_new_element (GST_OBJECT (src), s));
+        GST_INFO_OBJECT (src, "Posted pre-EOS message to bus");
+      }
+      
+      /* Allow time for consumers to process pre-EOS */
+      g_usleep (100000);  /* 100ms */
+
       GST_INFO_OBJECT (src, "Client disconnected, sending EOS");
       gst_pad_push_event (src->srcpad, gst_event_new_eos ());
       gst_task_pause (src->task);
