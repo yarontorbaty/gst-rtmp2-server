@@ -900,6 +900,30 @@ send_connect (GTask * task)
      * XXX: libavformat sends "pageUrl" here, if provided. */
   }
 
+  /*
+   * Enhanced RTMP (E-RTMP) capability advertisement.
+   *
+   * When publishing, include capsEx and videoFourCcInfoMap so the ingest
+   * server knows we can send HEVC, VP9, or AV1 inside Enhanced FLV tags.
+   * Servers that don't understand these fields simply ignore them.
+   */
+  if (publish) {
+    /* capsEx bitmask: reconnect(1) | multitrack(2) | timestampNanoOffset(4) */
+    gst_amf_node_append_field_number (node, "capsEx", 0x07);
+
+    GstAmfNode *fourcc_map = gst_amf_node_new_object ();
+    /* Advertise HEVC support — value 0 means "supported, no restrictions" */
+    gst_amf_node_append_field_number (fourcc_map, "hvc1", 0);
+    gst_amf_node_append_field (node, "videoFourCcInfoMap", fourcc_map);
+
+    /* Also include fourCcList for servers that check the array form */
+    GstAmfNode *fourcc_list = gst_amf_node_new_object ();
+    gst_amf_node_append_field_string (fourcc_list, "0", "hvc1", 4);
+    gst_amf_node_append_field (node, "fourCcList", fourcc_list);
+
+    GST_DEBUG ("E-RTMP: advertising capsEx=0x07, videoFourCcInfoMap={hvc1:0}");
+  }
+
   g_ptr_array_add (arguments, node);
 
   /* Parse librtmp style connect parameters */

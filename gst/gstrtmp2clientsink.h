@@ -1,6 +1,5 @@
-/*
- * GStreamer
- * Copyright (C) 2025 Yaron Torbaty <yarontorbaty@gmail.com>
+/* GStreamer Enhanced RTMP Client Sink Element
+ * Copyright (C) 2026 Yaron Torbaty <yarontorbaty@gmail.com>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Library General Public
@@ -18,34 +17,19 @@
  * Boston, MA 02110-1301, USA.
  */
 
-#ifdef HAVE_CONFIG_H
-#include "config.h"
-#endif
+#ifndef __GST_ERTMP2_CLIENT_SINK_H__
+#define __GST_ERTMP2_CLIENT_SINK_H__
 
-#include "gstrtmp2server.h"
-#include "gstrtmp2serversrc.h"
-#include "gstrtmp2clientsink.h"
+#include <gst/gst.h>
+#include <gst/base/gstbasesink.h>
 
-static gboolean
-plugin_init (GstPlugin * plugin)
-{
-  gboolean ret = TRUE;
+G_BEGIN_DECLS
 
-  ret &= gst_element_register (plugin, "rtmp2serversrc",
-      GST_RANK_NONE, GST_TYPE_RTMP2_SERVER_SRC);
-  ret &= gst_element_register (plugin, "ertmp2sink",
-      GST_RANK_NONE, GST_TYPE_ERTMP2_CLIENT_SINK);
+#define GST_TYPE_ERTMP2_CLIENT_SINK (gst_ertmp2_client_sink_get_type())
 
-  return ret;
-}
+G_DECLARE_FINAL_TYPE (GstErtmp2ClientSink, gst_ertmp2_client_sink,
+    GST, ERTMP2_CLIENT_SINK, GstBaseSink)
 
-GST_PLUGIN_DEFINE (GST_VERSION_MAJOR,
-    GST_VERSION_MINOR,
-    rtmp2server,
-    "RTMP2 Server and Enhanced RTMP Client Plugin",
-    plugin_init,
-    PACKAGE_VERSION,
-    GST_LICENSE,
-    GST_PACKAGE_NAME,
-    GST_PACKAGE_ORIGIN)
+G_END_DECLS
 
+#endif /* __GST_ERTMP2_CLIENT_SINK_H__ */

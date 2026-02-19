@@ -48,10 +48,17 @@ rtmp_lib_sources = [
   'gst/rtmp/rtmpflv.c',
 ]
 
-# Plugin sources
+# Plugin sources (server-specific implementations in gst/ directory)
 gst_rtmp2_server_sources = [
   'gst/gstrtmp2serversrc.c',
+  'gst/gstrtmp2clientsink.c',
   'gst/gstrtmp2server.c',
+  'gst/rtmp2client.c',
+  'gst/rtmp2chunk.c',
+  'gst/rtmp2chunk_v2.c',
+  'gst/rtmp2amf.c',
+  'gst/rtmp2enhanced.c',
+  'gst/rtmp2handshake.c',
 ]
 
 gst_rtmp2_server = library('gstrtmp2server',
