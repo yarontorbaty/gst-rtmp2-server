@@ -27,6 +27,7 @@
 #include "rtmp2chunk_v2.h"
 #include <string.h>
 #include <glib/gprintf.h>
+#include <netinet/in.h>   /* For IPPROTO_TCP */
 #include <netinet/tcp.h>  /* For TCP_NODELAY */
 
 /* Define our own debug category */
