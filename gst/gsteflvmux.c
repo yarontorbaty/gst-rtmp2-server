@@ -202,12 +202,14 @@ push_flv_header_and_metadata (GstEFlvMux * mux)
   GstFlowReturn ret;
 
   /* Send required srcpad events before the first buffer push.
+   * Order must be: STREAM_START → CAPS → SEGMENT.
    * Without these, gst_pad_push returns GST_FLOW_ERROR. */
-  gst_pad_push_event (mux->srcpad,
-      gst_event_new_stream_start ("eflvmux-stream"));
+  GstEvent *ss_event = gst_event_new_stream_start ("eflvmux-stream");
+  gst_event_set_group_id (ss_event, gst_util_group_id_next ());
+  gst_pad_push_event (mux->srcpad, ss_event);
 
   GstCaps *flv_caps = gst_caps_new_empty_simple ("video/x-flv");
-  gst_pad_push_event (mux->srcpad, gst_event_new_caps (flv_caps));
+  gst_pad_set_caps (mux->srcpad, flv_caps);
   gst_caps_unref (flv_caps);
 
   GstSegment segment;
