@@ -203,11 +203,8 @@ push_flv_header_and_metadata (GstEFlvMux * mux)
 
   /* Send required srcpad events before the first buffer push.
    * Without these, gst_pad_push returns GST_FLOW_ERROR. */
-  gchar *stream_id = gst_pad_create_stream_id (mux->srcpad,
-      GST_ELEMENT (mux), "eflvmux");
   gst_pad_push_event (mux->srcpad,
-      gst_event_new_stream_start (stream_id));
-  g_free (stream_id);
+      gst_event_new_stream_start ("eflvmux-stream"));
 
   GstCaps *flv_caps = gst_caps_new_empty_simple ("video/x-flv");
   gst_pad_push_event (mux->srcpad, gst_event_new_caps (flv_caps));
