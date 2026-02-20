@@ -26,8 +26,8 @@ static GstStaticPadTemplate video_sink_template =
     GST_STATIC_PAD_TEMPLATE ("video",
     GST_PAD_SINK, GST_PAD_REQUEST,
     GST_STATIC_CAPS (
-        "video/x-h264, stream-format=avc, alignment=au; "
-        "video/x-h265, stream-format={hvc1,hev1}, alignment=au"));
+        "video/x-h264, stream-format={avc,byte-stream}, alignment=au; "
+        "video/x-h265, stream-format={hvc1,hev1,byte-stream}, alignment=au"));
 
 static GstStaticPadTemplate audio_sink_template =
     GST_STATIC_PAD_TEMPLATE ("audio",
