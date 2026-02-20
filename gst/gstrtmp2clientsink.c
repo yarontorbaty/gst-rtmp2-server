@@ -90,6 +90,9 @@ struct _GstErtmp2ClientSink
   gboolean header_sent;
   guint32 base_ts;
   gboolean base_ts_set;
+
+  /* Thread that called start() — used to fix connection thread ownership */
+  GThread *start_thread;
 };
 
 static GstStaticPadTemplate sink_template =
@@ -362,11 +365,10 @@ ertmp_connect_done (GObject * source, GAsyncResult * result,
 
   GST_INFO_OBJECT (self, "E-RTMP connected, starting publish");
 
-  /* Update the connection's thread reference to the current thread.
-   * The connection was created inside a GIO callback which may have
-   * recorded a different thread. We need send_command to work from
-   * whichever thread drives g_main_context_iteration. */
-  gst_rtmp_connection_set_thread (self->connection, g_thread_self ());
+  /* Fix thread ownership: the connection was created on a GIO pool thread
+   * but we need send_command to work from the start() thread that drives
+   * g_main_context_iteration. */
+  gst_rtmp_connection_set_thread (self->connection, self->start_thread);
 
   gst_rtmp_client_start_publish_async (self->connection,
       self->rtmp_location.stream, NULL, ertmp_publish_done, self);
@@ -424,6 +426,9 @@ gst_ertmp2_client_sink_start (GstBaseSink * sink)
   self->context = g_main_context_new ();
   self->loop = g_main_loop_new (self->context, FALSE);
 
+  /* Remember which thread we're on for connection thread ownership */
+  self->start_thread = g_thread_self ();
+
   /* Push as thread-default so GIO async operations dispatch here */
   g_main_context_push_thread_default (self->context);
 
@@ -448,9 +453,8 @@ gst_ertmp2_client_sink_start (GstBaseSink * sink)
     g_main_context_iteration (self->context, TRUE);
   }
 
-  g_main_context_pop_thread_default (self->context);
-
   if (self->connect_error) {
+    g_main_context_pop_thread_default (self->context);
     GError *err = self->connect_error;
     self->connect_error = NULL;
     GST_ELEMENT_ERROR (self, RESOURCE, OPEN_WRITE,
@@ -458,6 +462,8 @@ gst_ertmp2_client_sink_start (GstBaseSink * sink)
     g_error_free (err);
     return FALSE;
   }
+
+  g_main_context_pop_thread_default (self->context);
 
   /* Connection established. Start the GMainLoop in a thread for ongoing I/O
    * (reading server responses, keepalives, etc.) */
