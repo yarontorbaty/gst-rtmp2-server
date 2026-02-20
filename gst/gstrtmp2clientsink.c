@@ -423,17 +423,18 @@ gst_ertmp2_client_sink_start (GstBaseSink * sink)
   self->context = g_main_context_new ();
   self->loop = g_main_loop_new (self->context, FALSE);
 
-  /* Start the GMainLoop thread FIRST. All RTMP operations (connect,
-   * handshake, createStream, publish, I/O) happen on this thread
-   * which owns the GMainContext as thread-default. */
-  self->loop_thread =
-      g_thread_new ("ertmp-io", ertmp_loop_thread_func, self);
-
-  /* Schedule connect via idle source on the loop's context */
+  /* Attach the connect idle source BEFORE starting the loop thread.
+   * This ensures the source is queued when the loop starts iterating. */
   GSource *idle = g_idle_source_new ();
   g_source_set_callback (idle, ertmp_connect_idle, self, NULL);
   g_source_attach (idle, self->context);
   g_source_unref (idle);
+
+  /* Start the GMainLoop thread. All RTMP operations (connect, handshake,
+   * createStream, publish, I/O) happen on this thread which owns the
+   * GMainContext as thread-default. */
+  self->loop_thread =
+      g_thread_new ("ertmp-io", ertmp_loop_thread_func, self);
 
   /* Wait for publish to complete or timeout */
   g_mutex_lock (&self->lock);
