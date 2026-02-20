@@ -365,11 +365,6 @@ ertmp_connect_done (GObject * source, GAsyncResult * result,
 
   GST_INFO_OBJECT (self, "E-RTMP connected, starting publish");
 
-  /* Fix thread ownership: the connection was created on a GIO pool thread
-   * but we need send_command to work from the start() thread that drives
-   * g_main_context_iteration. */
-  gst_rtmp_connection_set_thread (self->connection, self->start_thread);
-
   gst_rtmp_client_start_publish_async (self->connection,
       self->rtmp_location.stream, NULL, ertmp_publish_done, self);
 }
@@ -419,56 +414,45 @@ gst_ertmp2_client_sink_start (GstBaseSink * sink)
     return FALSE;
   }
 
-  /* Create GMainContext for async RTMP operations.
-   * We drive the context synchronously from THIS thread during start()
-   * to avoid cross-thread issues with rtmpconnection's thread checks.
-   * After publish succeeds, we spin up a GMainLoop thread for ongoing I/O. */
   self->context = g_main_context_new ();
   self->loop = g_main_loop_new (self->context, FALSE);
 
-  /* Remember which thread we're on for connection thread ownership */
-  self->start_thread = g_thread_self ();
+  /* Start the GMainLoop thread FIRST. All RTMP operations (connect,
+   * handshake, createStream, publish, I/O) happen on this thread
+   * which owns the GMainContext as thread-default. */
+  self->loop_thread =
+      g_thread_new ("ertmp-io", ertmp_loop_thread_func, self);
 
-  /* Push as thread-default so GIO async operations dispatch here */
-  g_main_context_push_thread_default (self->context);
+  /* Schedule connect via idle source on the loop's context */
+  GSource *idle = g_idle_source_new ();
+  g_source_set_callback (idle, ertmp_connect_idle, self, NULL);
+  g_source_attach (idle, self->context);
+  g_source_unref (idle);
 
-  /* Initiate the connect */
-  GST_INFO_OBJECT (self, "Initiating E-RTMP connect (synchronous)");
-  gst_rtmp_client_connect_async (&self->rtmp_location, NULL,
-      ertmp_connect_done, self);
-
-  /* Drive the context synchronously until publish completes or timeout */
+  /* Wait for publish to complete or timeout */
+  g_mutex_lock (&self->lock);
   gint64 end_time =
       g_get_monotonic_time () + (gint64) self->timeout * G_TIME_SPAN_SECOND;
-
   while (!self->publish_started && !self->connect_error) {
-    if (g_get_monotonic_time () >= end_time) {
-      g_main_context_pop_thread_default (self->context);
+    if (!g_cond_wait_until (&self->cond, &self->lock, end_time)) {
+      g_mutex_unlock (&self->lock);
       GST_ELEMENT_ERROR (self, RESOURCE, OPEN_WRITE,
           ("Connection timeout"), ("Timed out connecting to %s",
               self->location));
       return FALSE;
     }
-    /* Iterate the context to dispatch callbacks (connect, publish, etc.) */
-    g_main_context_iteration (self->context, TRUE);
   }
 
   if (self->connect_error) {
-    g_main_context_pop_thread_default (self->context);
     GError *err = self->connect_error;
     self->connect_error = NULL;
+    g_mutex_unlock (&self->lock);
     GST_ELEMENT_ERROR (self, RESOURCE, OPEN_WRITE,
         ("E-RTMP connection failed"), ("%s", err->message));
     g_error_free (err);
     return FALSE;
   }
-
-  g_main_context_pop_thread_default (self->context);
-
-  /* Connection established. Start the GMainLoop in a thread for ongoing I/O
-   * (reading server responses, keepalives, etc.) */
-  self->loop_thread =
-      g_thread_new ("ertmp-io", ertmp_loop_thread_func, self);
+  g_mutex_unlock (&self->lock);
 
   self->header_sent = FALSE;
   self->base_ts_set = FALSE;
