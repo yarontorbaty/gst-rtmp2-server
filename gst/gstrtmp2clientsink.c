@@ -328,6 +328,17 @@ ertmp_loop_thread_func (gpointer user_data)
   return NULL;
 }
 
+/* Idle callback to start publish on the GMainLoop thread */
+static gboolean
+ertmp_start_publish_idle (gpointer user_data)
+{
+  GstErtmp2ClientSink *self = user_data;
+  GST_INFO_OBJECT (self, "Starting publish from loop thread");
+  gst_rtmp_client_start_publish_async (self->connection,
+      self->rtmp_location.stream, NULL, ertmp_publish_done, self);
+  return G_SOURCE_REMOVE;
+}
+
 /* Called when connect finishes */
 static void
 ertmp_connect_done (GObject * source, GAsyncResult * result,
@@ -349,10 +360,15 @@ ertmp_connect_done (GObject * source, GAsyncResult * result,
     return;
   }
 
-  GST_INFO_OBJECT (self, "E-RTMP connected, starting publish");
+  GST_INFO_OBJECT (self, "E-RTMP connected, scheduling publish on loop thread");
 
-  gst_rtmp_client_start_publish_async (self->connection,
-      self->rtmp_location.stream, NULL, ertmp_publish_done, self);
+  /* Schedule publish on the GMainLoop thread to avoid "wrong thread" errors.
+   * gst_rtmp_connection_send_command requires being called from the
+   * connection's GMainContext thread. */
+  GSource *idle = g_idle_source_new ();
+  g_source_set_callback (idle, ertmp_start_publish_idle, self, NULL);
+  g_source_attach (idle, self->context);
+  g_source_unref (idle);
 }
 
 /* Called when publish (createStream + publish) finishes */
