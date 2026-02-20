@@ -362,6 +362,12 @@ ertmp_connect_done (GObject * source, GAsyncResult * result,
 
   GST_INFO_OBJECT (self, "E-RTMP connected, starting publish");
 
+  /* Update the connection's thread reference to the current thread.
+   * The connection was created inside a GIO callback which may have
+   * recorded a different thread. We need send_command to work from
+   * whichever thread drives g_main_context_iteration. */
+  gst_rtmp_connection_set_thread (self->connection, g_thread_self ());
+
   gst_rtmp_client_start_publish_async (self->connection,
       self->rtmp_location.stream, NULL, ertmp_publish_done, self);
 }
