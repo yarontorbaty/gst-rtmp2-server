@@ -317,15 +317,6 @@ gst_rtmp_connection_get_socket (GstRtmpConnection * sc)
   return g_socket_connection_get_socket (sc->connection);
 }
 
-/* Allow ertmp2sink to update the thread reference after taking ownership */
-void
-gst_rtmp_connection_set_thread (GstRtmpConnection * sc, GThread * thread)
-{
-  g_return_if_fail (GST_IS_RTMP_CONNECTION (sc));
-  g_clear_pointer (&sc->thread, g_thread_unref);
-  sc->thread = g_thread_ref (thread);
-}
-
 static void
 gst_rtmp_connection_set_socket_connection (GstRtmpConnection * sc,
     GSocketConnection * connection)

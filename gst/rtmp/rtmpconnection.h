@@ -98,9 +98,6 @@ gst_rtmp_connection_send_command_with_args (GstRtmpConnection * connection,
 GstStructure * gst_rtmp_connection_get_null_stats (void);
 GstStructure * gst_rtmp_connection_get_stats (GstRtmpConnection * connection);
 
-void gst_rtmp_connection_set_thread (GstRtmpConnection * connection,
-    GThread * thread);
-
 G_END_DECLS
 
 #endif

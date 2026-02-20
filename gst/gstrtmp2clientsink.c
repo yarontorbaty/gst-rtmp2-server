@@ -92,8 +92,6 @@ struct _GstErtmp2ClientSink
   guint32 base_ts;
   gboolean base_ts_set;
 
-  /* Thread that called start() — used to fix connection thread ownership */
-  GThread *start_thread;
 };
 
 static GstStaticPadTemplate sink_template =
@@ -618,7 +616,7 @@ gst_ertmp2_client_sink_render (GstBaseSink * sink, GstBuffer * buffer)
 
   if (!self->connected || !self->connection) {
     GST_WARNING_OBJECT (self, "Not connected, dropping buffer");
-    return GST_FLOW_OK;
+    return GST_FLOW_ERROR;
   }
 
   if (!gst_buffer_map (buffer, &map, GST_MAP_READ)) {
