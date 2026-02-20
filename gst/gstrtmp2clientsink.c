@@ -61,7 +61,7 @@ enum
 };
 
 #define DEFAULT_LOCATION NULL
-#define DEFAULT_TIMEOUT 5
+#define DEFAULT_TIMEOUT 30
 
 struct _GstErtmp2ClientSink
 {
@@ -306,12 +306,25 @@ parse_rtmp_location (GstErtmp2ClientSink * self)
   return TRUE;
 }
 
+/* Idle callback: fires on the GMainLoop thread to initiate the connect */
+static gboolean
+ertmp_connect_idle (gpointer user_data)
+{
+  GstErtmp2ClientSink *self = user_data;
+  GST_INFO_OBJECT (self, "Initiating E-RTMP connect from loop thread");
+  gst_rtmp_client_connect_async (&self->rtmp_location, NULL,
+      ertmp_connect_done, self);
+  return G_SOURCE_REMOVE;
+}
+
 /* GMainLoop thread for async I/O */
 static gpointer
 ertmp_loop_thread_func (gpointer user_data)
 {
   GstErtmp2ClientSink *self = user_data;
+  g_main_context_push_thread_default (self->context);
   g_main_loop_run (self->loop);
+  g_main_context_pop_thread_default (self->context);
   return NULL;
 }
 
@@ -391,15 +404,15 @@ gst_ertmp2_client_sink_start (GstBaseSink * sink)
   self->context = g_main_context_new ();
   self->loop = g_main_loop_new (self->context, FALSE);
 
-  g_main_context_push_thread_default (self->context);
+  /* Schedule the connect to fire once the loop is running.
+   * GIO async operations require the GMainContext to be the thread-default
+   * context AND actively iterating. Without this, callbacks never dispatch. */
+  GSource *idle = g_idle_source_new ();
+  g_source_set_callback (idle, ertmp_connect_idle, self, NULL);
+  g_source_attach (idle, self->context);
+  g_source_unref (idle);
 
-  /* Start async connect */
-  gst_rtmp_client_connect_async (&self->rtmp_location, NULL,
-      ertmp_connect_done, self);
-
-  g_main_context_pop_thread_default (self->context);
-
-  /* Run GMainLoop in a thread */
+  /* Start the GMainLoop in a dedicated thread */
   self->loop_thread =
       g_thread_new ("ertmp-io", ertmp_loop_thread_func, self);
 
