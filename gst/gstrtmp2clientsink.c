@@ -408,9 +408,6 @@ gst_ertmp2_client_sink_start (GstBaseSink * sink)
 {
   GstErtmp2ClientSink *self = GST_ERTMP2_CLIENT_SINK (sink);
 
-  fprintf (stderr, "[ertmp2sink] start() called, location=%s\n",
-      self->location ? self->location : "(null)");
-
   if (!parse_rtmp_location (self)) {
     GST_ELEMENT_ERROR (self, RESOURCE, NOT_FOUND,
         ("Invalid RTMP URL"), ("Could not parse location: %s",
@@ -468,8 +465,7 @@ gst_ertmp2_client_sink_start (GstBaseSink * sink)
   self->header_sent = FALSE;
   self->base_ts_set = FALSE;
 
-  fprintf (stderr, "[ertmp2sink] start() completed: publish_started=%d stream_id=%u\n",
-      self->publish_started, self->stream_id);
+  GST_INFO_OBJECT (self, "E-RTMP sink started successfully");
   return TRUE;
 }
 

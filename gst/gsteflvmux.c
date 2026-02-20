@@ -201,6 +201,22 @@ push_flv_header_and_metadata (GstEFlvMux * mux)
 {
   GstFlowReturn ret;
 
+  /* Send required srcpad events before the first buffer push.
+   * Without these, gst_pad_push returns GST_FLOW_ERROR. */
+  gchar *stream_id = gst_pad_create_stream_id (mux->srcpad,
+      GST_ELEMENT (mux), "eflvmux");
+  gst_pad_push_event (mux->srcpad,
+      gst_event_new_stream_start (stream_id));
+  g_free (stream_id);
+
+  GstCaps *flv_caps = gst_caps_new_empty_simple ("video/x-flv");
+  gst_pad_push_event (mux->srcpad, gst_event_new_caps (flv_caps));
+  gst_caps_unref (flv_caps);
+
+  GstSegment segment;
+  gst_segment_init (&segment, GST_FORMAT_TIME);
+  gst_pad_push_event (mux->srcpad, gst_event_new_segment (&segment));
+
   /* FLV file header (9 bytes) + PreviousTagSize0 (4 bytes) */
   guint8 header[13] = {
     'F', 'L', 'V', 0x01,
