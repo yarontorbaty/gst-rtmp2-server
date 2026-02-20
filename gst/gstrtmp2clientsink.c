@@ -622,7 +622,7 @@ gst_ertmp2_client_sink_render (GstBaseSink * sink, GstBuffer * buffer)
 
   if (!self->connected || !self->connection) {
     GST_WARNING_OBJECT (self, "Not connected, dropping buffer");
-    return GST_FLOW_ERROR;
+    return GST_FLOW_OK;
   }
 
   if (!gst_buffer_map (buffer, &map, GST_MAP_READ)) {
