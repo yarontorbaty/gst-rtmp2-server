@@ -25,6 +25,7 @@
 #include "gstrtmp2server.h"
 #include "gstrtmp2serversrc.h"
 #include "gstrtmp2clientsink.h"
+#include "gsteflvmux.h"
 
 static gboolean
 plugin_init (GstPlugin * plugin)
@@ -35,6 +36,8 @@ plugin_init (GstPlugin * plugin)
       GST_RANK_NONE, GST_TYPE_RTMP2_SERVER_SRC);
   ret &= gst_element_register (plugin, "ertmp2sink",
       GST_RANK_NONE, GST_TYPE_ERTMP2_CLIENT_SINK);
+  ret &= gst_element_register (plugin, "eflvmux",
+      GST_RANK_NONE, GST_TYPE_EFLVMUX);
 
   return ret;
 }

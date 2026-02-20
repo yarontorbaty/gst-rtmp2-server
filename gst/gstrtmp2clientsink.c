@@ -523,35 +523,45 @@ send_flv_data (GstErtmp2ClientSink * self, GstMapInfo * map)
     }
 
     GstRtmpMessageType msg_type;
+    guint32 chunk_stream;
     switch (tag_type) {
       case 8:
         msg_type = GST_RTMP_MESSAGE_TYPE_AUDIO;
+        chunk_stream = 4;
         break;
       case 9:
         msg_type = GST_RTMP_MESSAGE_TYPE_VIDEO;
+        chunk_stream = 6;
         break;
       case 18:
         msg_type = GST_RTMP_MESSAGE_TYPE_DATA_AMF0;
+        chunk_stream = 4;
         break;
       default:
         GST_DEBUG_OBJECT (self, "Unknown FLV tag type %u, skipping", tag_type);
         offset += tag_total;
-        /* Skip PreviousTagSize */
         if (offset + 4 <= size)
           offset += 4;
         continue;
     }
 
-    /* Create RTMP message buffer with the tag body (skip 11-byte FLV header) */
-    GstBuffer *msg_buf = gst_rtmp_message_new_wrapped (msg_type,
-        (msg_type == GST_RTMP_MESSAGE_TYPE_DATA_AMF0) ? 4 : 6,
-        self->stream_id,
-        g_memdup2 (data + offset + 11, data_size), data_size);
+    GstBuffer *msg_buf;
 
-    /* Set the timestamp on the RTMP meta */
-    GstRtmpMeta *meta = gst_buffer_get_rtmp_meta (msg_buf);
-    if (meta) {
-      meta->ts_delta = timestamp;
+    if (tag_type == 18) {
+      /*
+       * Metadata: the FLV tag body already contains @setDataFrame + onMetaData
+       * from eflvmux, so pass it through as-is.
+       */
+      msg_buf = gst_rtmp_message_new_wrapped (msg_type, chunk_stream,
+          self->stream_id,
+          g_memdup2 (data + offset + 11, data_size), data_size);
+      GST_BUFFER_DTS (msg_buf) = 0;
+    } else {
+      msg_buf = gst_rtmp_message_new_wrapped (msg_type, chunk_stream,
+          self->stream_id,
+          g_memdup2 (data + offset + 11, data_size), data_size);
+      GST_BUFFER_DTS (msg_buf) =
+          (GstClockTime) timestamp * GST_MSECOND;
     }
 
     gst_rtmp_connection_queue_message (self->connection, msg_buf);

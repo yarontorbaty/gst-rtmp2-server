@@ -52,6 +52,7 @@ rtmp_lib_sources = [
 gst_rtmp2_server_sources = [
   'gst/gstrtmp2serversrc.c',
   'gst/gstrtmp2clientsink.c',
+  'gst/gsteflvmux.c',
   'gst/gstrtmp2server.c',
   'gst/rtmp2client.c',
   'gst/rtmp2chunk.c',
