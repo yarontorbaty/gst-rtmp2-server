@@ -414,6 +414,12 @@ gst_ertmp2_client_sink_start (GstBaseSink * sink)
     return FALSE;
   }
 
+  /* Reset connection state from any previous session */
+  self->connected = FALSE;
+  self->publish_started = FALSE;
+  g_clear_error (&self->connect_error);
+  self->stream_id = 0;
+
   self->context = g_main_context_new ();
   self->loop = g_main_loop_new (self->context, FALSE);
 
