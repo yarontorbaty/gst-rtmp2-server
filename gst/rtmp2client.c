@@ -646,6 +646,8 @@ rtmp2_client_free (Rtmp2Client * client)
   g_free (client->application);
   g_free (client->stream_key);
   g_free (client->tc_url);
+  g_free (client->auth_username);
+  g_free (client->auth_password);
 
   if (client->client_caps)
     rtmp2_enhanced_capabilities_free (client->client_caps);
@@ -1546,6 +1548,41 @@ rtmp2_client_parse_connect (Rtmp2Client * client, const guint8 * data,
     client->application = g_strdup (src->application);
   }
 
+  /* Parse publish credentials from the client's tcUrl query params (Wowza-style).
+   * Encoders send: rtmp://host/live?username=bob&password=secret/streamkey
+   * The enhanced connect parser may have extracted 'app' as "live?username=bob&password=secret".
+   * We parse username= and password= from the app or tcUrl if present. */
+  if (client->client_caps && client->client_caps->app) {
+    const char *query = strchr(client->client_caps->app, '?');
+    if (query) {
+      query++;  /* Skip '?' */
+      /* Parse key=value pairs separated by '&' */
+      char *params = g_strdup(query);
+      char *saveptr = NULL;
+      char *token = strtok_r(params, "&", &saveptr);
+      while (token) {
+        char *eq = strchr(token, '=');
+        if (eq) {
+          *eq = '\0';
+          const char *key = token;
+          const char *val = eq + 1;
+          if (g_ascii_strcasecmp(key, "username") == 0 || g_ascii_strcasecmp(key, "user") == 0) {
+            g_free(client->auth_username);
+            client->auth_username = g_strdup(val);
+          } else if (g_ascii_strcasecmp(key, "password") == 0 || g_ascii_strcasecmp(key, "pass") == 0) {
+            g_free(client->auth_password);
+            client->auth_password = g_strdup(val);
+          }
+        }
+        token = strtok_r(NULL, "&", &saveptr);
+      }
+      g_free(params);
+      if (client->auth_username) {
+        GST_DEBUG ("Parsed RTMP auth credentials: user='%s'", client->auth_username);
+      }
+    }
+  }
+
   client->connect_received = TRUE;
   
   /* Send window ack size, peer bandwidth, and set chunk size first */
@@ -1624,12 +1661,65 @@ gboolean
 rtmp2_client_parse_publish (Rtmp2Client * client, const guint8 * data,
     gsize size, GError ** error)
 {
-  /* Simplified parsing - full implementation would parse AMF0 */
   GstRtmp2ServerSrc *src = (GstRtmp2ServerSrc *) client->user_data;
 
-  if (src && src->stream_key) {
-    /* Validate stream key if set */
-    /* For now, just accept */
+  /* Parse stream name from AMF0 publish command:
+   * AMF0: string "publish", number (txn), null, string (stream_name), string (type)
+   * We skip the method name (already identified by caller), parse txn + null + stream_name */
+  char stream_name[256] = "";
+  if (data && size > 0) {
+    gsize offset = 0;
+    /* Skip transaction ID (AMF0 number: type=0x00, 8 bytes) */
+    if (offset < size && data[offset] == 0x00) {
+      offset += 1 + 8;
+    }
+    /* Skip null (AMF0 null: type=0x05) */
+    if (offset < size && data[offset] == 0x05) {
+      offset += 1;
+    }
+    /* Read stream name (AMF0 string: type=0x02, 2-byte length, data) */
+    if (offset + 3 <= size && data[offset] == 0x02) {
+      offset += 1;
+      guint16 slen = (data[offset] << 8) | data[offset + 1];
+      offset += 2;
+      if (offset + slen <= size && slen < sizeof(stream_name)) {
+        memcpy(stream_name, data + offset, slen);
+        stream_name[slen] = '\0';
+        GST_DEBUG ("Parsed publish stream name: '%s'", stream_name);
+      }
+    }
+  }
+
+  /* Validate stream key if configured */
+  if (src && src->stream_key && src->stream_key[0]) {
+    if (stream_name[0] == '\0' || strcmp(stream_name, src->stream_key) != 0) {
+      GST_WARNING ("Stream key mismatch: expected '%s', got '%s'",
+          src->stream_key, stream_name);
+      /* Reject with NetStream.Publish.BadName */
+      g_set_error (error, G_IO_ERROR, G_IO_ERROR_PERMISSION_DENIED,
+          "Stream key rejected");
+      return FALSE;
+    }
+  }
+
+  /* Validate publish credentials if configured (Wowza-style tcUrl query params).
+   * The username/password are parsed from the 'app' or 'tcUrl' during parse_connect
+   * and stored on the client struct. */
+  if (src && src->publish_username && src->publish_username[0]) {
+    gboolean auth_ok = FALSE;
+    if (client->auth_username && client->auth_password &&
+        strcmp(client->auth_username, src->publish_username) == 0 &&
+        strcmp(client->auth_password, src->publish_password ? src->publish_password : "") == 0) {
+      auth_ok = TRUE;
+    }
+    if (!auth_ok) {
+      GST_WARNING ("Publish authentication failed: user='%s'",
+          client->auth_username ? client->auth_username : "(none)");
+      g_set_error (error, G_IO_ERROR, G_IO_ERROR_PERMISSION_DENIED,
+          "Publish authentication failed");
+      return FALSE;
+    }
+    GST_DEBUG ("Publish authenticated: user='%s'", client->auth_username);
   }
 
   client->publish_received = TRUE;

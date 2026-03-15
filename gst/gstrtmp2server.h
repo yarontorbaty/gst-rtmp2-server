@@ -58,6 +58,8 @@ struct _GstRtmp2ServerSrc {
   gboolean tls;
   gchar *certificate;
   gchar *private_key;
+  gchar *publish_username;    /* RTMP publish auth (Wowza-style, from tcUrl query params) */
+  gchar *publish_password;
 
   /* Server state */
   GSocket *server_socket;

@@ -67,7 +67,9 @@ enum {
   PROP_TIMEOUT,
   PROP_TLS,
   PROP_CERTIFICATE,
-  PROP_PRIVATE_KEY
+  PROP_PRIVATE_KEY,
+  PROP_PUBLISH_USERNAME,
+  PROP_PUBLISH_PASSWORD
 };
 
 /* Always pad template - raw FLV output for simple pipelines */
@@ -160,6 +162,18 @@ gst_rtmp2_server_src_class_init (GstRtmp2ServerSrcClass *klass)
           "PEM private key file for TLS", NULL,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
+  g_object_class_install_property (gobject_class, PROP_PUBLISH_USERNAME,
+      g_param_spec_string ("publish-username", "Publish Username",
+          "If set, require this username for RTMP publish authentication "
+          "(parsed from tcUrl query params: ?username=X&password=Y)", NULL,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (gobject_class, PROP_PUBLISH_PASSWORD,
+      g_param_spec_string ("publish-password", "Publish Password",
+          "If set, require this password for RTMP publish authentication "
+          "(parsed from tcUrl query params: ?username=X&password=Y)", NULL,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
   gst_element_class_set_static_metadata (gstelement_class,
       "RTMP2 Server Source",
       "Source/Network",
@@ -242,6 +256,8 @@ gst_rtmp2_server_src_finalize (GObject *object)
   g_free (src->stream_key);
   g_free (src->certificate);
   g_free (src->private_key);
+  g_free (src->publish_username);
+  g_free (src->publish_password);
 
   if (src->video_caps)
     gst_caps_unref (src->video_caps);
@@ -301,6 +317,14 @@ gst_rtmp2_server_src_set_property (GObject *object, guint prop_id,
       g_free (src->private_key);
       src->private_key = g_value_dup_string (value);
       break;
+    case PROP_PUBLISH_USERNAME:
+      g_free (src->publish_username);
+      src->publish_username = g_value_dup_string (value);
+      break;
+    case PROP_PUBLISH_PASSWORD:
+      g_free (src->publish_password);
+      src->publish_password = g_value_dup_string (value);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
@@ -337,6 +361,12 @@ gst_rtmp2_server_src_get_property (GObject *object, guint prop_id,
       break;
     case PROP_PRIVATE_KEY:
       g_value_set_string (value, src->private_key);
+      break;
+    case PROP_PUBLISH_USERNAME:
+      g_value_set_string (value, src->publish_username);
+      break;
+    case PROP_PUBLISH_PASSWORD:
+      g_value_set_string (value, src->publish_password);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);

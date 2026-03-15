@@ -61,6 +61,8 @@ typedef struct _Rtmp2Client {
       gchar *application;
       gchar *stream_key;
       gchar *tc_url;
+      gchar *auth_username;    /* Parsed from tcUrl query params (Wowza-style auth) */
+      gchar *auth_password;
       
       gdouble connect_transaction_id;
       
