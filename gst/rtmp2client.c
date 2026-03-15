@@ -1549,11 +1549,15 @@ rtmp2_client_parse_connect (Rtmp2Client * client, const guint8 * data,
   }
 
   /* Parse publish credentials from the client's tcUrl query params (Wowza-style).
-   * Encoders send: rtmp://host/live?username=bob&password=secret/streamkey
-   * The enhanced connect parser may have extracted 'app' as "live?username=bob&password=secret".
-   * We parse username= and password= from the app or tcUrl if present. */
-  if (client->client_caps && client->client_caps->app) {
-    const char *query = strchr(client->client_caps->app, '?');
+   * Encoders send: rtmp://host/live?username=bob&password=secret
+   * The tcUrl from the RTMP connect command contains the full URL.
+   * We parse username= and password= query params from it. */
+  const char *auth_source = client->tc_url;
+  if (!auth_source && src && src->application) {
+    auth_source = src->application;  /* Fallback to configured app name */
+  }
+  if (auth_source) {
+    const char *query = strchr(auth_source, '?');
     if (query) {
       query++;  /* Skip '?' */
       /* Parse key=value pairs separated by '&' */
